@@ -114,19 +114,55 @@ impl MeshEngine {
         let meta = Arc::new(CausalMetadataStore::with_journal_path(&journal_path)?);
         let objects = DashMap::new();
 
-        Ok(Self {
+        let engine = Self {
             meta,
             blobs,
             express,
             objects,
             workspaces: DashMap::new(),
             upstream_git_url,
-        })
+        };
+        engine.rehydrate_objects_from_packs(&packs_dir);
+        Ok(engine)
+    }
+
+    fn rehydrate_objects_from_packs(&self, packs_dir: &FsPath) {
+        let Ok(entries) = std::fs::read_dir(packs_dir) else {
+            return;
+        };
+        let mut pack_buffers = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) == Some("pack") {
+                if let Ok(bytes) = std::fs::read(&path) {
+                    pack_buffers.push(Bytes::from(bytes));
+                }
+            }
+        }
+        // Decode all stored packfiles and populate `(repo_id, oid)` for known repos
+        let mut decoded_all = Vec::new();
+        for buf in &pack_buffers {
+            if let Ok(dec) = decode_and_validate_pack(buf, |oid| {
+                decoded_all
+                    .iter()
+                    .find(|(id, _): &&(ObjectId, GitObject)| id == oid)
+                    .map(|(_, o)| o.clone())
+            }) {
+                for obj in dec.objects {
+                    decoded_all.push((obj.oid, obj));
+                }
+            }
+        }
+        // Associate objects with global wildcard `("*", oid)` fallback so any repo can look them up
+        for (oid, obj) in decoded_all {
+            self.objects.insert(("*".to_string(), oid), obj);
+        }
     }
 
     pub fn get_object(&self, repo_id: &str, oid: &ObjectId) -> Option<GitObject> {
         self.objects
             .get(&(repo_id.to_string(), *oid))
+            .or_else(|| self.objects.get(&("*".to_string(), *oid)))
             .map(|r| r.value().clone())
     }
 
@@ -986,6 +1022,7 @@ async fn handle_receive_pack(
 async fn handle_upload_pack(
     State(state): State<AppState>,
     Path(repo): Path<String>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     let req = match parse_upload_pack_request(&body) {
@@ -1042,12 +1079,24 @@ async fn handle_upload_pack(
         }
     };
 
-    // Pando `packfile-uri` mode: return Express CDN URLs + 32-byte empty inline packfile
+    // Pando `packfile-uri` mode: return Express CDN URLs + 32-byte empty inline packfile.
+    // Resolve base URL from incoming `Host` / `X-Forwarded-Proto` header so remote devices get
+    // reachable URLs rather than 127.0.0.1.
     if req.supports_packfile_uris {
+        let scheme = headers
+            .get("x-forwarded-proto")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("http");
+        let base_url = headers
+            .get(header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .map(|host| format!("{scheme}://{host}"))
+            .unwrap_or_else(|| state.public_base_url.clone());
+
         let uris: Vec<String> = plan
             .selected_covers
             .iter()
-            .map(|c| format!("{}/express/packs/{}", state.public_base_url, c.pack_id))
+            .map(|c| format!("{base_url}/express/packs/{}", c.pack_id))
             .collect();
         let response_bytes = encode_packfile_uri_response(&uris);
         return Response::builder()
