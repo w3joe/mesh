@@ -6,6 +6,9 @@ use mesh_proto::{
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
+use std::fs::{self, OpenOptions};
+use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -25,6 +28,8 @@ pub enum MetaError {
     RefNotFound(String, String),
     #[error("missing cover for ref '{ref_name}' at version {version}")]
     MissingCover { ref_name: String, version: u64 },
+    #[error("persistence io error: {0}")]
+    Io(String),
 }
 
 #[derive(Clone, Debug)]
@@ -51,6 +56,23 @@ pub struct FetchPlan {
     pub total_bytes: u64,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+enum JournalRecord {
+    Push {
+        pointer: RefPointer,
+        ref_version: RefVersion,
+        l0_cover: PackCover,
+        commit_locations: Vec<CommitLocation>,
+    },
+    DeleteRef {
+        repo_id: String,
+        ref_name: String,
+    },
+    InsertCover {
+        cover: PackCover,
+    },
+}
+
 pub trait MeshMetadataStore: Send + Sync {
     /// Fetch the current pointer for a single branch ($O(1)$).
     fn get_ref_pointer(&self, repo_id: &str, ref_name: &str) -> Option<RefPointer>;
@@ -72,6 +94,14 @@ pub trait MeshMetadataStore: Send + Sync {
     /// Pushes to distinct branches never contend on locks.
     fn commit_push(&self, tx: PushTransaction) -> Result<RefVersion, MetaError>;
 
+    /// Atomically deletes a branch reference after verifying `expected_old_oid` via CAS.
+    fn delete_ref(
+        &self,
+        repo_id: &str,
+        ref_name: &str,
+        expected_old_oid: ObjectId,
+    ) -> Result<(), MetaError>;
+
     /// Lookup a specific `RefVersion` record.
     fn get_ref_version(&self, repo_id: &str, ref_name: &str, version: u64) -> Option<RefVersion>;
 
@@ -84,7 +114,8 @@ pub trait MeshMetadataStore: Send + Sync {
         end_version: u64,
     ) -> Vec<RefVersion>;
 
-    /// Resolve a commit hash to the earliest `(ref_name, ref_version)` that introduced it.
+    /// Resolve a commit hash to the earliest `(ref_name, ref_version)` that introduced it
+    /// (with trunk `refs/heads/main` taking precedence once merged).
     fn resolve_commit(&self, repo_id: &str, commit_oid: &ObjectId) -> Option<CommitLocation>;
 
     /// Register a compacted `PackCover` at level `L1..L4` without deleting lower levels.
@@ -105,9 +136,6 @@ pub trait MeshMetadataStore: Send + Sync {
     ) -> Result<FetchPlan, MetaError>;
 }
 
-/// Key for per-branch concurrency control: `(repo_id, ref_name)`.
-/// Because locks are striped per `(repo_id, ref_name)` in a concurrent `DashMap`,
-/// two pushes to different branches execute with zero mutual contention.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct RefKey {
     repo_id: String,
@@ -118,15 +146,16 @@ struct RefKey {
 struct BranchState {
     pointer: Option<RefPointer>,
     versions: BTreeMap<u64, RefVersion>,
-    /// LSM skip-list indexed by `(start_version, level)` -> `PackCover`
     covers_by_start: BTreeMap<u64, Vec<PackCover>>,
 }
 
-/// High-concurrency Causal Metadata Store with per-ref lock striping and LSM skip-list covers.
+/// High-concurrency Causal Metadata Store with per-ref lock striping, LSM skip-list covers,
+/// and optional durable append-only journal persistence.
 pub struct CausalMetadataStore {
     branches: DashMap<RefKey, Arc<Mutex<BranchState>>>,
     repo_refs: DashMap<String, DashMap<String, ()>>,
     commit_index: DashMap<(String, ObjectId), CommitLocation>,
+    journal_file: Option<Mutex<std::fs::File>>,
     total_cas_commits: AtomicU64,
     total_cas_conflicts: AtomicU64,
 }
@@ -143,8 +172,119 @@ impl CausalMetadataStore {
             branches: DashMap::new(),
             repo_refs: DashMap::new(),
             commit_index: DashMap::new(),
+            journal_file: None,
             total_cas_commits: AtomicU64::new(0),
             total_cas_conflicts: AtomicU64::new(0),
+        }
+    }
+
+    /// Opens or creates a durable journal-backed `CausalMetadataStore` at `journal_path`,
+    /// replaying all historical ref versions, covers, and commit locations on startup.
+    pub fn with_journal_path(journal_path: impl AsRef<Path>) -> Result<Self, MetaError> {
+        let path: PathBuf = journal_path.as_ref().to_path_buf();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| MetaError::Io(e.to_string()))?;
+        }
+
+        let store = Self::new();
+        if path.exists() {
+            let file =
+                fs::File::open(&path).map_err(|e| MetaError::Io(format!("open journal: {e}")))?;
+            let reader = BufReader::new(file);
+            for line in reader.lines() {
+                let line = line.map_err(|e| MetaError::Io(e.to_string()))?;
+                if line.trim().is_empty() {
+                    continue;
+                }
+                if let Ok(record) = serde_json::from_str::<JournalRecord>(&line) {
+                    store.apply_journal_record(record);
+                }
+            }
+        }
+
+        let writer = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|e| MetaError::Io(format!("open journal append: {e}")))?;
+
+        Ok(Self {
+            branches: store.branches,
+            repo_refs: store.repo_refs,
+            commit_index: store.commit_index,
+            journal_file: Some(Mutex::new(writer)),
+            total_cas_commits: store.total_cas_commits,
+            total_cas_conflicts: store.total_cas_conflicts,
+        })
+    }
+
+    fn apply_journal_record(&self, record: JournalRecord) {
+        match record {
+            JournalRecord::Push {
+                pointer,
+                ref_version,
+                l0_cover,
+                commit_locations,
+            } => {
+                let lock = self.branch_lock(&pointer.repo_id, &pointer.ref_name);
+                {
+                    let mut state = lock.lock();
+                    let v = ref_version.version;
+                    state.pointer = Some(pointer.clone());
+                    state.versions.insert(v, ref_version);
+                    state.covers_by_start.entry(v).or_default().push(l0_cover);
+                }
+                self.repo_refs
+                    .entry(pointer.repo_id.clone())
+                    .or_default()
+                    .insert(pointer.ref_name.clone(), ());
+                for loc in commit_locations {
+                    self.index_commit_location(loc);
+                }
+            }
+            JournalRecord::DeleteRef { repo_id, ref_name } => {
+                let lock = self.branch_lock(&repo_id, &ref_name);
+                {
+                    let mut state = lock.lock();
+                    state.pointer = None;
+                }
+                if let Some(refs) = self.repo_refs.get(&repo_id) {
+                    refs.remove(&ref_name);
+                }
+            }
+            JournalRecord::InsertCover { cover } => {
+                self.insert_pack_cover_in_memory(cover);
+            }
+        }
+    }
+
+    fn append_journal(&self, record: &JournalRecord) -> Result<(), MetaError> {
+        if let Some(ref mutex) = self.journal_file {
+            let mut line =
+                serde_json::to_string(record).map_err(|e| MetaError::Io(e.to_string()))?;
+            line.push('\n');
+            let mut file = mutex.lock();
+            file.write_all(line.as_bytes())
+                .map_err(|e| MetaError::Io(e.to_string()))?;
+            file.flush().map_err(|e| MetaError::Io(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    fn index_commit_location(&self, loc: CommitLocation) {
+        let key = (loc.repo_id.clone(), loc.commit_oid);
+        let is_trunk = loc.ref_name == "refs/heads/main";
+        match self.commit_index.entry(key) {
+            dashmap::mapref::entry::Entry::Vacant(v) => {
+                v.insert(loc);
+            }
+            dashmap::mapref::entry::Entry::Occupied(mut o) => {
+                // Bug 8 Fix: If a commit was previously indexed on a topic branch and is now
+                // pushed/merged onto `refs/heads/main`, promote its location to `refs/heads/main`!
+                if is_trunk && o.get().ref_name != "refs/heads/main" {
+                    o.insert(loc);
+                }
+            }
         }
     }
 
@@ -168,6 +308,21 @@ impl CausalMetadataStore {
         self.total_cas_conflicts.load(Ordering::Relaxed)
     }
 
+    fn insert_pack_cover_in_memory(&self, cover: PackCover) {
+        let lock = self.branch_lock(&cover.repo_id, &cover.ref_name);
+        let mut state = lock.lock();
+        let list = state
+            .covers_by_start
+            .entry(cover.start_version)
+            .or_default();
+        if !list
+            .iter()
+            .any(|c| c.level == cover.level && c.end_version == cover.end_version)
+        {
+            list.push(cover);
+        }
+    }
+
     /// Greedily covers the version range `(have_version, want_version]` on a single branch
     /// using the highest-level LSM `PackCover`s available (Skip-List traversal in $O(\log \Delta)$).
     fn select_interval_covers(
@@ -185,8 +340,6 @@ impl CausalMetadataStore {
 
         while cursor <= want_version {
             *metadata_reads += 1;
-            // Find any cover starting at `cursor` (or covering `cursor` if aligned to geometric boundary)
-            // that reaches as far as possible without exceeding `want_version`.
             let mut best_cover: Option<&PackCover> = None;
 
             if let Some(covers_at_cursor) = state.covers_by_start.get(&cursor) {
@@ -267,7 +420,6 @@ impl MeshMetadataStore for CausalMetadataStore {
     }
 
     fn commit_push(&self, tx: PushTransaction) -> Result<RefVersion, MetaError> {
-        // Resolve default base_trunk_version if pushing to a non-trunk branch and none was specified
         let trunk_ver = if tx.base_trunk_version.is_some() {
             tx.base_trunk_version
         } else if tx.ref_name != "refs/heads/main" {
@@ -278,7 +430,7 @@ impl MeshMetadataStore for CausalMetadataStore {
         };
 
         let branch_mutex = self.branch_lock(&tx.repo_id, &tx.ref_name);
-        let ref_version = {
+        let (ptr, ref_version, l0_cover) = {
             let mut state = branch_mutex.lock();
             let current_oid = state
                 .pointer
@@ -296,10 +448,7 @@ impl MeshMetadataStore for CausalMetadataStore {
             }
 
             let next_version = state
-                .pointer
-                .as_ref()
-                .map(|p| p.current_version + 1)
-                .unwrap_or(1);
+                .version_counter_next();
 
             let now_ms = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -339,44 +488,85 @@ impl MeshMetadataStore for CausalMetadataStore {
                 object_count: tx.pack_object_count,
             };
 
-            state.pointer = Some(ptr);
+            state.pointer = Some(ptr.clone());
             state.versions.insert(next_version, rv.clone());
             state
                 .covers_by_start
                 .entry(next_version)
                 .or_default()
-                .push(l0_cover);
+                .push(l0_cover.clone());
 
-            rv
+            (ptr, rv, l0_cover)
         };
 
-        // Register ref in repo index
         self.repo_refs
             .entry(tx.repo_id.clone())
             .or_default()
             .insert(tx.ref_name.clone(), ());
 
-        // Index commits -> RefVersion
         let mut commits_to_index = tx.introduced_commits;
         if !commits_to_index.contains(&tx.new_commit_oid) {
             commits_to_index.push(tx.new_commit_oid);
         }
+        let mut commit_locations = Vec::new();
         for oid in commits_to_index {
             if !oid.is_zero() {
-                // Keep earliest RefVersion (preferring trunk if already on trunk)
-                self.commit_index
-                    .entry((tx.repo_id.clone(), oid))
-                    .or_insert_with(|| CommitLocation {
-                        repo_id: tx.repo_id.clone(),
-                        commit_oid: oid,
-                        ref_name: tx.ref_name.clone(),
-                        ref_version: ref_version.version,
-                    });
+                let loc = CommitLocation {
+                    repo_id: tx.repo_id.clone(),
+                    commit_oid: oid,
+                    ref_name: tx.ref_name.clone(),
+                    ref_version: ref_version.version,
+                };
+                self.index_commit_location(loc.clone());
+                commit_locations.push(loc);
             }
         }
 
+        self.append_journal(&JournalRecord::Push {
+            pointer: ptr,
+            ref_version: ref_version.clone(),
+            l0_cover,
+            commit_locations,
+        })?;
+
         self.total_cas_commits.fetch_add(1, Ordering::Relaxed);
         Ok(ref_version)
+    }
+
+    fn delete_ref(
+        &self,
+        repo_id: &str,
+        ref_name: &str,
+        expected_old_oid: ObjectId,
+    ) -> Result<(), MetaError> {
+        let branch_mutex = self.branch_lock(repo_id, ref_name);
+        {
+            let mut state = branch_mutex.lock();
+            let current_oid = state
+                .pointer
+                .as_ref()
+                .map(|p| p.tip_commit_oid)
+                .unwrap_or(ObjectId::ZERO);
+
+            if current_oid != expected_old_oid {
+                self.total_cas_conflicts.fetch_add(1, Ordering::Relaxed);
+                return Err(MetaError::CasConflict {
+                    ref_name: ref_name.to_string(),
+                    expected_old: expected_old_oid,
+                    actual_current: current_oid,
+                });
+            }
+            state.pointer = None;
+        }
+        if let Some(refs) = self.repo_refs.get(repo_id) {
+            refs.remove(ref_name);
+        }
+        self.append_journal(&JournalRecord::DeleteRef {
+            repo_id: repo_id.to_string(),
+            ref_name: ref_name.to_string(),
+        })?;
+        self.total_cas_commits.fetch_add(1, Ordering::Relaxed);
+        Ok(())
     }
 
     fn get_ref_version(&self, repo_id: &str, ref_name: &str, version: u64) -> Option<RefVersion> {
@@ -418,18 +608,8 @@ impl MeshMetadataStore for CausalMetadataStore {
     }
 
     fn insert_pack_cover(&self, cover: PackCover) {
-        let lock = self.branch_lock(&cover.repo_id, &cover.ref_name);
-        let mut state = lock.lock();
-        let list = state
-            .covers_by_start
-            .entry(cover.start_version)
-            .or_default();
-        if !list
-            .iter()
-            .any(|c| c.level == cover.level && c.end_version == cover.end_version)
-        {
-            list.push(cover);
-        }
+        self.insert_pack_cover_in_memory(cover.clone());
+        let _ = self.append_journal(&JournalRecord::InsertCover { cover });
     }
 
     fn list_pack_covers(&self, repo_id: &str, ref_name: &str) -> Vec<PackCover> {
@@ -512,7 +692,6 @@ impl MeshMetadataStore for CausalMetadataStore {
         let mut selected_covers = Vec::new();
         let mut seen_packs = HashSet::new();
 
-        // 1. Plan trunk covers over `(have_trunk_version, required_trunk_version]` in O(log Δ)
         if required_trunk_version > have_trunk_version {
             let key = RefKey {
                 repo_id: repo_id.to_string(),
@@ -539,10 +718,6 @@ impl MeshMetadataStore for CausalMetadataStore {
             }
         }
 
-        // 2. Plan side-branch covers
-        // Remember Pando's design: because pushes to a feature branch are negotiated against
-        // `trunk` only, the latest push on a feature branch at `target_ver` already contains
-        // all objects on that topic branch since `base_trunk_version`!
         for (branch_ref, target_ver) in wanted_branch_targets {
             let held_ver = have_branch_versions.get(&branch_ref).copied().unwrap_or(0);
             if target_ver <= held_ver {
@@ -560,8 +735,6 @@ impl MeshMetadataStore for CausalMetadataStore {
                 .clone();
             let state = lock.lock();
             metadata_reads += 1;
-            // In Pando, a topic branch push against trunk contains the full topic delta in its
-            // latest L0 pack at `target_ver`.
             if let Some(covers_at_tip) = state.covers_by_start.get(&target_ver) {
                 if let Some(tip_cover) = covers_at_tip.first() {
                     if seen_packs.insert(tip_cover.pack_id.clone()) {
@@ -570,7 +743,6 @@ impl MeshMetadataStore for CausalMetadataStore {
                     }
                 }
             }
-            // Fallback to interval cover if the branch used incremental stacking
             let branch_covers = Self::select_interval_covers(
                 &state,
                 &branch_ref,
@@ -595,6 +767,12 @@ impl MeshMetadataStore for CausalMetadataStore {
     }
 }
 
+impl BranchState {
+    fn version_counter_next(&self) -> u64 {
+        self.versions.keys().next_back().copied().unwrap_or(0) + 1
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -610,7 +788,6 @@ mod tests {
         let store = CausalMetadataStore::new();
         let repo = "openai/monorepo";
 
-        // Push 32 versions to `refs/heads/main`
         let mut prev_oid = ObjectId::ZERO;
         for v in 1..=32u64 {
             let new_oid = fake_oid(v);
@@ -633,7 +810,6 @@ mod tests {
             prev_oid = new_oid;
         }
 
-        // Insert L1 covers (spanning 8 versions each) and an L2 cover (spanning 16 versions: 5..=20)
         store.insert_pack_cover(PackCover {
             repo_id: repo.to_string(),
             ref_name: "refs/heads/main".to_string(),
@@ -655,7 +831,6 @@ mod tests {
             object_count: 25,
         });
 
-        // Push a feature branch `refs/heads/agent-99` based on trunk v31
         let topic_oid = fake_oid(999);
         store
             .commit_push(PushTransaction {
@@ -674,20 +849,8 @@ mod tests {
             })
             .unwrap();
 
-        // Client HAS trunk v4 (`fake_oid(4)`) and WANTS `refs/heads/agent-99` (`topic_oid`, which depends on trunk v31).
-        // Expected cover path for trunk (4..=31]:
-        //   - v5..=20  (1 L2 cover: pack-l2-5-20)
-        //   - v21..=28 (1 L1 cover: pack-l1-21-28)
-        //   - v29, v30, v31 (3 L0 covers)
-        //   + 1 topic pack (pack-topic-99)
-        // Total = 6 packs instead of 28 L0 packs!
         let plan = store
-            .plan_fetch_covers(
-                repo,
-                "refs/heads/main",
-                &[fake_oid(4)],
-                &[topic_oid],
-            )
+            .plan_fetch_covers(repo, "refs/heads/main", &[fake_oid(4)], &[topic_oid])
             .unwrap();
 
         let pack_ids: Vec<&str> = plan
@@ -706,5 +869,32 @@ mod tests {
                 "pack-topic-99"
             ]
         );
+
+        // Verify trunk commit promotion when `topic_oid` is fast-forwarded onto `refs/heads/main`
+        store
+            .commit_push(PushTransaction {
+                repo_id: repo.to_string(),
+                ref_name: "refs/heads/main".to_string(),
+                expected_old_oid: fake_oid(32),
+                new_commit_oid: topic_oid,
+                introduced_commits: vec![topic_oid],
+                l0_pack_id: PackId("pack-l0-33".to_string()),
+                pack_byte_size: 1500,
+                pack_object_count: 4,
+                explicit_haves: vec![],
+                base_trunk_version: None,
+                intent_receipt: None,
+                semantic_deltas: vec![],
+            })
+            .unwrap();
+        let promoted = store.resolve_commit(repo, &topic_oid).unwrap();
+        assert_eq!(promoted.ref_name, "refs/heads/main");
+        assert_eq!(promoted.ref_version, 33);
+
+        // Verify branch deletion
+        store
+            .delete_ref(repo, "refs/heads/agent-99", topic_oid)
+            .unwrap();
+        assert!(store.get_ref_pointer(repo, "refs/heads/agent-99").is_none());
     }
 }

@@ -5,6 +5,7 @@ use mesh_proto::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use tree_sitter::{Node, Parser};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CstMergeOutcome {
@@ -24,7 +25,9 @@ pub enum CstMergeOutcome {
 pub fn detect_language(file_path: &str) -> Option<&'static str> {
     if file_path.ends_with(".rs") {
         Some("rust")
-    } else if file_path.ends_with(".ts") || file_path.ends_with(".tsx") {
+    } else if file_path.ends_with(".tsx") {
+        Some("tsx")
+    } else if file_path.ends_with(".ts") {
         Some("typescript")
     } else if file_path.ends_with(".js") || file_path.ends_with(".jsx") {
         Some("javascript")
@@ -43,262 +46,465 @@ fn hash_bytes(bytes: &[u8]) -> String {
     hex::encode(&hasher.finalize()[..16])
 }
 
-/// Parses a source file into Concrete Syntax Tree (CST) top-level declaration spans,
-/// preserving leading doc-comments/attributes and exact byte offsets.
+/// Parses a source file into Concrete Syntax Tree (CST) top-level declaration spans using
+/// `tree-sitter` (for Rust, TypeScript/JS, Python) or a string-aware lexical scanner (for Go).
+///
+/// Guarantees:
+/// - Rejects any file containing syntax errors (`root.has_error()`).
+/// - Attaches leading doc-comments and attributes (`///`, `#[...]`) to the declaration they document.
+/// - Captures `mod`, `static`, `macro_rules!`, and inner attributes (`#![...]`) so zero top-level
+///   statements are ever lost during CST reconstruction.
 pub fn parse_cst_spans(file_path: &str, source: &str) -> Result<Vec<SymbolSpan>, String> {
     let lang = detect_language(file_path).ok_or_else(|| "unsupported language".to_string())?;
-    // Quick brace balance sanity check for brace-delimited languages
-    if matches!(lang, "rust" | "typescript" | "javascript" | "go") && !is_brace_balanced(source) {
-        return Err("syntax error: unbalanced braces in source file".to_string());
+    match lang {
+        "rust" | "typescript" | "tsx" | "javascript" | "python" => {
+            parse_with_tree_sitter(lang, source)
+        }
+        "go" => parse_go_lexical(source),
+        _ => Err("unsupported language".to_string()),
     }
+}
 
-    let lines: Vec<&str> = source.split_inclusive('\n').collect();
-    let mut line_byte_offsets = Vec::with_capacity(lines.len() + 1);
-    let mut acc = 0usize;
-    for l in &lines {
-        line_byte_offsets.push(acc);
-        acc += l.len();
+fn parse_with_tree_sitter(lang: &str, source: &str) -> Result<Vec<SymbolSpan>, String> {
+    let mut parser = Parser::new();
+    let ts_lang = match lang {
+        "rust" => tree_sitter_rust::LANGUAGE.into(),
+        "tsx" => tree_sitter_typescript::LANGUAGE_TSX.into(),
+        "typescript" | "javascript" => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+        "python" => tree_sitter_python::LANGUAGE.into(),
+        _ => return Err("unsupported tree-sitter language".to_string()),
+    };
+    parser
+        .set_language(&ts_lang)
+        .map_err(|e| format!("failed to load tree-sitter grammar: {e}"))?;
+
+    let tree = parser
+        .parse(source, None)
+        .ok_or_else(|| "tree-sitter failed to parse source".to_string())?;
+    let root = tree.root_node();
+
+    if root.has_error() {
+        return Err("syntax error detected by tree-sitter CST parser".to_string());
     }
-    line_byte_offsets.push(acc);
 
     let mut spans = Vec::new();
-    let mut idx = 0usize;
-    let mut pending_trivia_start_line: Option<usize> = None;
+    let mut cursor = root.walk();
+    let children: Vec<Node> = root.children(&mut cursor).collect();
 
-    while idx < lines.len() {
-        let trimmed = lines[idx].trim();
+    let mut pending_start_byte: Option<usize> = None;
+    let mut pending_start_line: Option<usize> = None;
 
-        if trimmed.is_empty() {
-            pending_trivia_start_line = None;
-            idx += 1;
-            continue;
-        }
+    for child in children {
+        let kind_str = child.kind();
 
-        // Leading comments, docstrings, or attributes/decorators attach to the declaration that follows
-        if is_comment_or_attribute(trimmed) {
-            if pending_trivia_start_line.is_none() {
-                pending_trivia_start_line = Some(idx);
+        // Attach leading comments and outer attributes (`///`, `//`, `/* */`, `#[...]`) to the next item
+        if matches!(
+            kind_str,
+            "line_comment" | "block_comment" | "comment" | "attribute_item"
+        ) {
+            if pending_start_byte.is_none() {
+                pending_start_byte = Some(child.start_byte());
+                pending_start_line = Some(child.start_position().row + 1);
             }
-            idx += 1;
             continue;
         }
 
-        if let Some((kind, name)) = match_top_level_declaration(lang, trimmed) {
-            let start_line = pending_trivia_start_line.unwrap_or(idx);
-            pending_trivia_start_line = None;
+        let start_byte = pending_start_byte.take().unwrap_or_else(|| child.start_byte());
+        let start_line = pending_start_line
+            .take()
+            .unwrap_or_else(|| child.start_position().row + 1);
+        let end_byte = enforce_line_end_boundary(source, child.end_byte());
+        let end_line = child.end_position().row + 1;
 
-            let end_line = if kind == SymbolKind::Import {
-                find_import_end_line(&lines, idx)
-            } else if lang == "python" {
-                find_python_block_end_line(&lines, idx)
-            } else {
-                find_brace_or_statement_end_line(&lines, idx)
-            };
+        let raw_with_trivia = &source[start_byte..end_byte];
+        let decl_slice = &source[child.start_byte()..end_byte];
 
-            let start_byte = line_byte_offsets[start_line];
-            let end_byte = line_byte_offsets[(end_line + 1).min(lines.len())];
-            let raw_slice = &source[start_byte..end_byte];
-            let decl_slice = &source[line_byte_offsets[idx]..end_byte];
+        let (sym_kind, sym_name, signature) = classify_ts_node(lang, child, source, decl_slice);
+        let mut referenced_symbols = BTreeSet::new();
+        collect_called_identifiers_ast(child, source.as_bytes(), &sym_name, &mut referenced_symbols);
 
-            let signature = extract_signature(lang, kind, decl_slice);
-            let referenced_symbols = extract_called_identifiers(decl_slice, &name);
+        spans.push(SymbolSpan {
+            name: sym_name,
+            kind: sym_kind,
+            signature,
+            start_byte,
+            end_byte,
+            start_line,
+            end_line,
+            body_hash: hash_bytes(raw_with_trivia.trim().as_bytes()),
+            referenced_symbols: referenced_symbols.into_iter().collect(),
+        });
+    }
 
+    // If there are trailing comments at the end of the file not attached to a declaration, preserve them
+    if let (Some(sb), Some(sl)) = (pending_start_byte, pending_start_line) {
+        let raw = &source[sb..];
+        if !raw.trim().is_empty() {
             spans.push(SymbolSpan {
-                name,
-                kind,
-                signature,
-                start_byte,
-                end_byte,
-                start_line: start_line + 1,
-                end_line: end_line + 1,
-                body_hash: hash_bytes(raw_slice.trim().as_bytes()),
-                referenced_symbols,
+                name: format!("__trailing_comment_{sl}"),
+                kind: SymbolKind::VerbatimBlock,
+                signature: raw.trim().to_string(),
+                start_byte: sb,
+                end_byte: source.len(),
+                start_line: sl,
+                end_line: source.lines().count().max(sl),
+                body_hash: hash_bytes(raw.trim().as_bytes()),
+                referenced_symbols: vec![],
             });
-
-            idx = end_line + 1;
-        } else {
-            pending_trivia_start_line = None;
-            idx += 1;
         }
     }
 
     Ok(spans)
 }
 
-fn is_brace_balanced(source: &str) -> bool {
-    let mut depth = 0i64;
-    for ch in source.chars() {
-        if ch == '{' {
-            depth += 1;
-        } else if ch == '}' {
-            depth -= 1;
-            if depth < 0 {
-                return false;
+fn enforce_line_end_boundary(source: &str, byte_idx: usize) -> usize {
+    let bytes = source.as_bytes();
+    let mut i = byte_idx.min(bytes.len());
+    while i < bytes.len() && (bytes[i] == b';' || bytes[i] == b' ' || bytes[i] == b'\t' || bytes[i] == b'\r') {
+        i += 1;
+    }
+    if i < bytes.len() && bytes[i] == b'\n' {
+        i += 1;
+    }
+    i
+}
+
+fn classify_ts_node(
+    lang: &str,
+    node: Node,
+    source: &str,
+    decl_slice: &str,
+) -> (SymbolKind, String, String) {
+    let kind_str = node.kind();
+
+    // Unwrap TypeScript/JS `export_statement` around a declaration
+    if kind_str == "export_statement" {
+        let mut cursor = node.walk();
+        for sub in node.children(&mut cursor) {
+            if sub.kind() != "export" && sub.kind() != "default" && sub.kind() != "decorator" {
+                let (k, n, _) = classify_ts_node(lang, sub, source, decl_slice);
+                if k != SymbolKind::VerbatimBlock {
+                    let sig = extract_signature(lang, k, decl_slice);
+                    return (k, n, sig);
+                }
             }
+        }
+    }
+
+    // Unwrap Python `decorated_definition`
+    if kind_str == "decorated_definition" {
+        if let Some(def_node) = node.child_by_field_name("definition") {
+            let (k, n, _) = classify_ts_node(lang, def_node, source, decl_slice);
+            let sig = extract_signature(lang, k, decl_slice);
+            return (k, n, sig);
+        }
+    }
+
+    let sym_kind = match kind_str {
+        "use_declaration" | "import_statement" | "import_from_statement" => SymbolKind::Import,
+        "function_item" | "function_declaration" | "function_definition" | "generator_function_declaration" => {
+            SymbolKind::Function
+        }
+        "struct_item" => SymbolKind::Struct,
+        "enum_item" | "enum_declaration" => SymbolKind::Enum,
+        "trait_item" => SymbolKind::Trait,
+        "impl_item" => SymbolKind::Impl,
+        "class_declaration" | "class_definition" => SymbolKind::Class,
+        "interface_declaration" => SymbolKind::Interface,
+        "type_item" | "type_alias_declaration" => SymbolKind::TypeAlias,
+        "const_item" => SymbolKind::Const,
+        "static_item" => SymbolKind::Static,
+        "mod_item" | "internal_module" => SymbolKind::Module,
+        "macro_definition" | "macro_invocation" => SymbolKind::Macro,
+        "lexical_declaration" | "variable_declaration" => SymbolKind::Const,
+        "inner_attribute_item" => SymbolKind::VerbatimBlock,
+        _ => SymbolKind::VerbatimBlock,
+    };
+
+    let sig = extract_signature(lang, sym_kind, decl_slice);
+
+    let sym_name = match sym_kind {
+        SymbolKind::Import => decl_slice
+            .trim()
+            .trim_end_matches(';')
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" "),
+        SymbolKind::Impl => {
+            // Key impl blocks by their full header before `{` (e.g. `impl Display for User` vs `impl User`)
+            decl_slice
+                .split('{')
+                .next()
+                .unwrap_or(decl_slice)
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+        SymbolKind::VerbatimBlock => {
+            decl_slice
+                .trim()
+                .lines()
+                .next()
+                .unwrap_or("block")
+                .trim()
+                .to_string()
+        }
+        _ => {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                source[name_node.start_byte()..name_node.end_byte()].to_string()
+            } else {
+                extract_first_identifier(node, source)
+                    .unwrap_or_else(|| sig.clone())
+            }
+        }
+    };
+
+    (sym_kind, sym_name, sig)
+}
+
+fn extract_first_identifier(node: Node, source: &str) -> Option<String> {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if matches!(
+            child.kind(),
+            "identifier" | "type_identifier" | "property_identifier"
+        ) {
+            return Some(source[child.start_byte()..child.end_byte()].to_string());
+        }
+        if matches!(child.kind(), "variable_declarator" | "assignment") {
+            if let Some(id) = extract_first_identifier(child, source) {
+                return Some(id);
+            }
+        }
+    }
+    None
+}
+
+fn collect_called_identifiers_ast(
+    node: Node,
+    source: &[u8],
+    own_name: &str,
+    out: &mut BTreeSet<String>,
+) {
+    let kind = node.kind();
+    if matches!(kind, "call_expression" | "call") {
+        if let Some(func_node) = node.child_by_field_name("function") {
+            let ident = extract_call_target_name(func_node, source);
+            if !ident.is_empty() && ident != own_name {
+                out.insert(ident);
+            }
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_called_identifiers_ast(child, source, own_name, out);
+    }
+}
+
+fn extract_call_target_name(func_node: Node, source: &[u8]) -> String {
+    match func_node.kind() {
+        "identifier" | "field_identifier" | "property_identifier" => {
+            String::from_utf8_lossy(&source[func_node.start_byte()..func_node.end_byte()])
+                .to_string()
+        }
+        "scoped_identifier" | "field_expression" | "member_expression" | "attribute" => {
+            if let Some(name_child) = func_node
+                .child_by_field_name("name")
+                .or_else(|| func_node.child_by_field_name("field"))
+                .or_else(|| func_node.child_by_field_name("property"))
+                .or_else(|| func_node.child_by_field_name("attribute"))
+            {
+                String::from_utf8_lossy(&source[name_child.start_byte()..name_child.end_byte()])
+                    .to_string()
+            } else {
+                String::new()
+            }
+        }
+        _ => String::new(),
+    }
+}
+
+/// String- and comment-aware lexical fallback for Go (`.go`) files.
+fn parse_go_lexical(source: &str) -> Result<Vec<SymbolSpan>, String> {
+    if !is_brace_balanced_lexically(source) {
+        return Err("syntax error: unbalanced braces in Go source".to_string());
+    }
+    let lines: Vec<&str> = source.split_inclusive('\n').collect();
+    let mut offsets = Vec::with_capacity(lines.len() + 1);
+    let mut acc = 0usize;
+    for l in &lines {
+        offsets.push(acc);
+        acc += l.len();
+    }
+    offsets.push(acc);
+
+    let mut spans = Vec::new();
+    let mut idx = 0usize;
+    let mut pending_start: Option<usize> = None;
+
+    while idx < lines.len() {
+        let trimmed = lines[idx].trim();
+        if trimmed.is_empty() {
+            pending_start = None;
+            idx += 1;
+            continue;
+        }
+        if trimmed.starts_with("//") || trimmed.starts_with("/*") {
+            if pending_start.is_none() {
+                pending_start = Some(idx);
+            }
+            idx += 1;
+            continue;
+        }
+
+        let start_line = pending_start.take().unwrap_or(idx);
+        let end_line = find_brace_end_line_lexically(&lines, idx);
+        let start_byte = offsets[start_line];
+        let end_byte = offsets[(end_line + 1).min(lines.len())];
+        let decl_slice = &source[offsets[idx]..end_byte];
+        let raw_slice = &source[start_byte..end_byte];
+
+        let (kind, name) = if trimmed.starts_with("import ") {
+            (SymbolKind::Import, trimmed.to_string())
+        } else if let Some(rest) = trimmed.strip_prefix("func ") {
+            let ident = rest
+                .trim_start_matches(|c: char| c == '(' || c != ')')
+                .trim_start_matches(')')
+                .trim_start()
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect::<String>();
+            (
+                SymbolKind::Function,
+                if ident.is_empty() {
+                    trimmed.to_string()
+                } else {
+                    ident
+                },
+            )
+        } else if let Some(rest) = trimmed.strip_prefix("type ") {
+            let ident: String = rest
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            (SymbolKind::Struct, ident)
+        } else {
+            (SymbolKind::VerbatimBlock, trimmed.to_string())
+        };
+
+        let signature = extract_signature("go", kind, decl_slice);
+        spans.push(SymbolSpan {
+            name,
+            kind,
+            signature,
+            start_byte,
+            end_byte,
+            start_line: start_line + 1,
+            end_line: end_line + 1,
+            body_hash: hash_bytes(raw_slice.trim().as_bytes()),
+            referenced_symbols: vec![],
+        });
+        idx = end_line + 1;
+    }
+    Ok(spans)
+}
+
+/// Counts braces while ignoring `{` and `}` inside `//` comments, `/* */` comments,
+/// `"..."` string literals, and `'...'` char literals.
+pub fn is_brace_balanced_lexically(source: &str) -> bool {
+    let bytes = source.as_bytes();
+    let mut i = 0usize;
+    let mut depth = 0i64;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+            i += 2;
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+        } else if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            i += 2;
+        } else if b == b'"' || b == b'\'' || b == b'`' {
+            let quote = b;
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'\\' && quote != b'`' {
+                    i += 2;
+                    continue;
+                }
+                if bytes[i] == quote {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+        } else {
+            if b == b'{' {
+                depth += 1;
+            } else if b == b'}' {
+                depth -= 1;
+                if depth < 0 {
+                    return false;
+                }
+            }
+            i += 1;
         }
     }
     depth == 0
 }
 
-fn is_comment_or_attribute(trimmed: &str) -> bool {
-    trimmed.starts_with("//")
-        || trimmed.starts_with("/*")
-        || trimmed.starts_with('*')
-        || trimmed.starts_with("*/")
-        || trimmed.starts_with("#[")
-        || trimmed.starts_with("#![")
-        || trimmed.starts_with('@')
-        || trimmed.starts_with('#')
-}
-
-fn match_top_level_declaration(lang: &str, trimmed: &str) -> Option<(SymbolKind, String)> {
-    // Strip visibility & async/export modifiers
-    let mut s = trimmed;
-    for prefix in [
-        "pub(crate) ",
-        "pub(super) ",
-        "pub ",
-        "export default ",
-        "export ",
-        "async ",
-        "unsafe ",
-        "const fn ",
-    ] {
-        if prefix == "const fn " && s.starts_with("const fn ") {
-            s = &s["const ".len()..];
-        } else if let Some(rest) = s.strip_prefix(prefix) {
-            s = rest.trim_start();
-        }
-    }
-
-    // Imports
-    if s.starts_with("use ") || s.starts_with("import ") || (lang == "python" && s.starts_with("from ")) {
-        let import_key = s.trim_end_matches(';').trim().to_string();
-        return Some((SymbolKind::Import, import_key));
-    }
-
-    // Functions
-    for kw in ["fn ", "function ", "def ", "func "] {
-        if let Some(rest) = s.strip_prefix(kw) {
-            let name = extract_ident(rest)?;
-            return Some((SymbolKind::Function, name));
-        }
-    }
-
-    // Struct / Class / Interface / Enum / Trait / Type / Const
-    for (kw, kind) in [
-        ("struct ", SymbolKind::Struct),
-        ("enum ", SymbolKind::Enum),
-        ("trait ", SymbolKind::Trait),
-        ("impl ", SymbolKind::Impl),
-        ("class ", SymbolKind::Class),
-        ("interface ", SymbolKind::Interface),
-        ("type ", SymbolKind::TypeAlias),
-        ("const ", SymbolKind::Const),
-    ] {
-        if let Some(rest) = s.strip_prefix(kw) {
-            let name = if kind == SymbolKind::Impl {
-                rest.split('{').next().unwrap_or(rest).trim().to_string()
-            } else {
-                extract_ident(rest)?
-            };
-            return Some((kind, name));
-        }
-    }
-
-    None
-}
-
-fn extract_ident(s: &str) -> Option<String> {
-    let s = s.trim_start();
-    // Skip Go receiver `func (s *Server) Foo(...)`
-    let s = if s.starts_with('(') {
-        s.split_once(')')?.1.trim_start()
-    } else {
-        s
-    };
-    let ident: String = s
-        .chars()
-        .take_while(|c| c.is_alphanumeric() || *c == '_')
-        .collect();
-    if ident.is_empty() {
-        None
-    } else {
-        Some(ident)
-    }
-}
-
-fn find_import_end_line(lines: &[&str], start: usize) -> usize {
-    let mut i = start;
-    let mut brace_depth = 0i32;
-    while i < lines.len() {
-        for ch in lines[i].chars() {
-            if ch == '{' {
-                brace_depth += 1;
-            } else if ch == '}' {
-                brace_depth -= 1;
+fn find_brace_end_line_lexically(lines: &[&str], start: usize) -> usize {
+    let mut depth = 0i32;
+    let mut saw_open = false;
+    for (idx, line) in lines.iter().enumerate().skip(start) {
+        let bytes = line.as_bytes();
+        let mut k = 0usize;
+        while k < bytes.len() {
+            if bytes[k] == b'/' && k + 1 < bytes.len() && bytes[k + 1] == b'/' {
+                break;
             }
-        }
-        if brace_depth <= 0 {
-            break;
-        }
-        i += 1;
-    }
-    i.min(lines.len().saturating_sub(1))
-}
-
-fn find_brace_or_statement_end_line(lines: &[&str], start: usize) -> usize {
-    let mut i = start;
-    let mut brace_depth = 0i32;
-    let mut saw_open_brace = false;
-
-    while i < lines.len() {
-        let line = lines[i];
-        for ch in line.chars() {
-            if ch == '{' {
-                brace_depth += 1;
-                saw_open_brace = true;
-            } else if ch == '}' {
-                brace_depth -= 1;
+            if bytes[k] == b'"' || bytes[k] == b'\'' || bytes[k] == b'`' {
+                let q = bytes[k];
+                k += 1;
+                while k < bytes.len() {
+                    if bytes[k] == b'\\' && q != b'`' {
+                        k += 2;
+                        continue;
+                    }
+                    if bytes[k] == q {
+                        k += 1;
+                        break;
+                    }
+                    k += 1;
+                }
+                continue;
             }
+            if bytes[k] == b'{' {
+                depth += 1;
+                saw_open = true;
+            } else if bytes[k] == b'}' {
+                depth -= 1;
+            }
+            k += 1;
         }
-        if saw_open_brace && brace_depth <= 0 {
-            return i;
+        if saw_open && depth <= 0 {
+            return idx;
         }
-        if !saw_open_brace && line.trim_end().ends_with(';') {
-            return i;
+        if !saw_open && depth <= 0 {
+            return idx;
         }
-        i += 1;
     }
     lines.len().saturating_sub(1)
 }
 
-fn find_python_block_end_line(lines: &[&str], start: usize) -> usize {
-    let base_indent = lines[start]
-        .chars()
-        .take_while(|c| c.is_whitespace())
-        .count();
-    let mut last_non_empty = start;
-    let mut i = start + 1;
-    while i < lines.len() {
-        let trimmed = lines[i].trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            i += 1;
-            continue;
-        }
-        let indent = lines[i].chars().take_while(|c| c.is_whitespace()).count();
-        if indent <= base_indent {
-            break;
-        }
-        last_non_empty = i;
-        i += 1;
-    }
-    last_non_empty
-}
-
 fn extract_signature(lang: &str, kind: SymbolKind, decl_slice: &str) -> String {
-    if kind == SymbolKind::Import {
-        return decl_slice.trim().to_string();
+    if matches!(kind, SymbolKind::Import | SymbolKind::VerbatimBlock | SymbolKind::Module) {
+        return decl_slice.trim().trim_end_matches(';').to_string();
     }
     if lang == "python" {
         if let Some((head, _)) = decl_slice.split_once(':') {
@@ -317,48 +523,6 @@ fn extract_signature(lang: &str, kind: SymbolKind, decl_slice: &str) -> String {
         .join(" ")
 }
 
-/// Extracts function/method identifiers invoked via `ident(` inside a declaration body.
-fn extract_called_identifiers(decl_slice: &str, own_name: &str) -> Vec<String> {
-    let body = if let Some((_, b)) = decl_slice.split_once('{') {
-        b
-    } else if let Some((_, b)) = decl_slice.split_once(':') {
-        b
-    } else {
-        return Vec::new();
-    };
-
-    let mut refs = BTreeSet::new();
-    let bytes = body.as_bytes();
-    let mut i = 0usize;
-    while i < bytes.len() {
-        if bytes[i] == b'(' && i > 0 {
-            // Walk backward to collect identifier before `(`
-            let mut end = i;
-            while end > 0 && bytes[end - 1].is_ascii_whitespace() {
-                end -= 1;
-            }
-            let mut start = end;
-            while start > 0
-                && (bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_')
-            {
-                start -= 1;
-            }
-            if start < end {
-                let ident = &body[start..end];
-                if !matches!(
-                    ident,
-                    "if" | "for" | "while" | "match" | "switch" | "return" | "sizeof" | "Some" | "Ok" | "Err"
-                ) && ident != own_name
-                {
-                    refs.insert(ident.to_string());
-                }
-            }
-        }
-        i += 1;
-    }
-    refs.into_iter().collect()
-}
-
 /// Computes the structured `FileSemanticDelta` between `old_source` and `new_source`.
 pub fn compute_file_semantic_delta(
     file_path: &str,
@@ -371,13 +535,13 @@ pub fn compute_file_semantic_delta(
     let old_spans = parse_cst_spans(file_path, old_source).ok()?;
     let new_spans = parse_cst_spans(file_path, new_source).ok()?;
 
-    let old_map: BTreeMap<(u8, String), &SymbolSpan> = old_spans
+    let old_map: BTreeMap<(SymbolKind, String), &SymbolSpan> = old_spans
         .iter()
-        .map(|s| ((s.kind as u8, s.name.clone()), s))
+        .map(|s| ((s.kind, s.name.clone()), s))
         .collect();
-    let new_map: BTreeMap<(u8, String), &SymbolSpan> = new_spans
+    let new_map: BTreeMap<(SymbolKind, String), &SymbolSpan> = new_spans
         .iter()
-        .map(|s| ((s.kind as u8, s.name.clone()), s))
+        .map(|s| ((s.kind, s.name.clone()), s))
         .collect();
 
     let mut deltas = Vec::new();
@@ -386,6 +550,9 @@ pub fn compute_file_semantic_delta(
     for (key, new_s) in &new_map {
         if new_s.kind == SymbolKind::Import {
             imports.push(new_s.name.clone());
+            continue;
+        }
+        if new_s.kind == SymbolKind::VerbatimBlock {
             continue;
         }
         match old_map.get(key) {
@@ -417,7 +584,7 @@ pub fn compute_file_semantic_delta(
     }
 
     for (key, old_s) in &old_map {
-        if old_s.kind == SymbolKind::Import {
+        if matches!(old_s.kind, SymbolKind::Import | SymbolKind::VerbatimBlock) {
             continue;
         }
         if !new_map.contains_key(key) {
@@ -442,15 +609,14 @@ pub fn compute_file_semantic_delta(
     })
 }
 
-/// Verbatim CST Byte-Span Commutative 3-Way Merger.
+/// Verbatim CST Byte-Span Commutative 3-Way Merger powered by `tree-sitter`.
 ///
-/// Unlike line-based 3-way merge (`git merge-file`), this merger:
-/// 1. Treats top-level imports as an ordered set union.
-/// 2. Splices independent declaration modifications (`fn`, `struct`, `class`, `interface`)
-///    using their exact verbatim byte slices (preserving comments and formatting).
-/// 3. Splices new declarations added by both branches at the end of the file without
-///    raising a false line-collision conflict.
-/// 4. Detects true symbol-level conflicts AND intra-file signature/call mismatches.
+/// Key properties:
+/// 1. Never pretty-prints ASTs: splices exact byte slices from the original source buffers.
+/// 2. Preserves leading doc-comments, attributes (`#[...]`), inner attributes (`#![...]`),
+///    `mod` items, `static` items, and `macro_rules!` blocks without dropping any top-level code.
+/// 3. Keys declarations by `(SymbolKind, canonical_name)` so `struct Foo` and multiple
+///    `impl` blocks (`impl Foo` vs `impl Display for Foo`) never collide.
 pub fn cst_merge_3way(
     file_path: &str,
     branch_a_name: &str,
@@ -490,7 +656,7 @@ pub fn cst_merge_3way(
                 branch_a: branch_a_name.to_string(),
                 branch_b: branch_b_name.to_string(),
                 kind: SemanticConflictKind::UnstructuredOverlapFallback,
-                description: "File could not be decomposed into CST spans (syntax error or unsupported format)".to_string(),
+                description: "File could not be decomposed into error-free CST spans (syntax error or unsupported format)".to_string(),
             }],
             algebraic_conflict_preview: format_algebraic_conflict(
                 file_path,
@@ -522,20 +688,22 @@ pub fn cst_merge_3way(
         };
     }
 
-    let base_map: BTreeMap<String, &SymbolSpan> = base_spans
+    type DeclKey = (SymbolKind, String);
+
+    let base_map: BTreeMap<DeclKey, &SymbolSpan> = base_spans
         .iter()
         .filter(|s| s.kind != SymbolKind::Import)
-        .map(|s| (s.name.clone(), s))
+        .map(|s| ((s.kind, s.name.clone()), s))
         .collect();
-    let a_map: BTreeMap<String, &SymbolSpan> = a_spans
+    let a_map: BTreeMap<DeclKey, &SymbolSpan> = a_spans
         .iter()
         .filter(|s| s.kind != SymbolKind::Import)
-        .map(|s| (s.name.clone(), s))
+        .map(|s| ((s.kind, s.name.clone()), s))
         .collect();
-    let b_map: BTreeMap<String, &SymbolSpan> = b_spans
+    let b_map: BTreeMap<DeclKey, &SymbolSpan> = b_spans
         .iter()
         .filter(|s| s.kind != SymbolKind::Import)
-        .map(|s| (s.name.clone(), s))
+        .map(|s| ((s.kind, s.name.clone()), s))
         .collect();
 
     let mut conflicts = Vec::new();
@@ -548,13 +716,17 @@ pub fn cst_merge_3way(
         .iter()
         .filter(|s| s.kind == SymbolKind::Import)
         .filter(|s| {
-            !a_spans.iter().any(|x| x.name == s.name)
-                || !b_spans.iter().any(|x| x.name == s.name)
+            !a_spans.iter().any(|x| x.kind == SymbolKind::Import && x.name == s.name)
+                || !b_spans.iter().any(|x| x.kind == SymbolKind::Import && x.name == s.name)
         })
         .map(|s| s.name.clone())
         .collect();
 
-    for (src, spans) in [(base_src, &base_spans), (branch_a_src, &a_spans), (branch_b_src, &b_spans)] {
+    for (src, spans) in [
+        (base_src, &base_spans),
+        (branch_a_src, &a_spans),
+        (branch_b_src, &b_spans),
+    ] {
         for sp in spans.iter().filter(|s| s.kind == SymbolKind::Import) {
             if !base_deleted_imports.contains(&sp.name) && seen_imports.insert(sp.name.clone()) {
                 let raw = src[sp.start_byte..sp.end_byte].trim_end().to_string();
@@ -564,41 +736,50 @@ pub fn cst_merge_3way(
     }
 
     // 2. Determine declaration order: base order -> new in A -> new in B
-    let mut ordered_names = Vec::new();
-    let mut seen_names = HashSet::new();
+    let mut ordered_keys: Vec<DeclKey> = Vec::new();
+    let mut seen_keys: HashSet<DeclKey> = HashSet::new();
     for sp in base_spans
         .iter()
         .chain(a_spans.iter())
         .chain(b_spans.iter())
         .filter(|s| s.kind != SymbolKind::Import)
     {
-        if seen_names.insert(sp.name.clone()) {
-            ordered_names.push(sp.name.clone());
+        let key = (sp.kind, sp.name.clone());
+        if seen_keys.insert(key.clone()) {
+            ordered_keys.push(key);
         }
     }
 
+    let mut header_verbatim_blocks = Vec::new();
     let mut merged_blocks = Vec::new();
 
-    for name in &ordered_names {
-        let base_sp = base_map.get(name).copied();
-        let a_sp = a_map.get(name).copied();
-        let b_sp = b_map.get(name).copied();
+    for key in &ordered_keys {
+        let name = &key.1;
+        let base_sp = base_map.get(key).copied();
+        let a_sp = a_map.get(key).copied();
+        let b_sp = b_map.get(key).copied();
+
+        let target_vec = if key.0 == SymbolKind::VerbatimBlock && name.starts_with("#![") {
+            &mut header_verbatim_blocks
+        } else {
+            &mut merged_blocks
+        };
 
         match (base_sp, a_sp, b_sp) {
             (Some(base), Some(a), Some(b)) => {
                 let a_changed = a.body_hash != base.body_hash;
                 let b_changed = b.body_hash != base.body_hash;
                 if !a_changed && !b_changed {
-                    merged_blocks.push(base_src[base.start_byte..base.end_byte].trim_end().to_string());
+                    target_vec.push(base_src[base.start_byte..base.end_byte].trim_end().to_string());
                 } else if a_changed && !b_changed {
                     merged_symbols.push(name.clone());
-                    merged_blocks.push(branch_a_src[a.start_byte..a.end_byte].trim_end().to_string());
+                    target_vec.push(branch_a_src[a.start_byte..a.end_byte].trim_end().to_string());
                 } else if !a_changed && b_changed {
                     merged_symbols.push(name.clone());
-                    merged_blocks.push(branch_b_src[b.start_byte..b.end_byte].trim_end().to_string());
+                    target_vec.push(branch_b_src[b.start_byte..b.end_byte].trim_end().to_string());
                 } else if a.body_hash == b.body_hash {
                     merged_symbols.push(name.clone());
-                    merged_blocks.push(branch_a_src[a.start_byte..a.end_byte].trim_end().to_string());
+                    target_vec.push(branch_a_src[a.start_byte..a.end_byte].trim_end().to_string());
                 } else {
                     conflicts.push(SemanticConflict {
                         file_path: file_path.to_string(),
@@ -614,16 +795,16 @@ pub fn cst_merge_3way(
             }
             (None, Some(a), None) => {
                 merged_symbols.push(name.clone());
-                merged_blocks.push(branch_a_src[a.start_byte..a.end_byte].trim_end().to_string());
+                target_vec.push(branch_a_src[a.start_byte..a.end_byte].trim_end().to_string());
             }
             (None, None, Some(b)) => {
                 merged_symbols.push(name.clone());
-                merged_blocks.push(branch_b_src[b.start_byte..b.end_byte].trim_end().to_string());
+                target_vec.push(branch_b_src[b.start_byte..b.end_byte].trim_end().to_string());
             }
             (None, Some(a), Some(b)) => {
                 if a.body_hash == b.body_hash {
                     merged_symbols.push(name.clone());
-                    merged_blocks.push(branch_a_src[a.start_byte..a.end_byte].trim_end().to_string());
+                    target_vec.push(branch_a_src[a.start_byte..a.end_byte].trim_end().to_string());
                 } else {
                     conflicts.push(SemanticConflict {
                         file_path: file_path.to_string(),
@@ -638,7 +819,6 @@ pub fn cst_merge_3way(
                 }
             }
             (Some(base), Some(a), None) => {
-                // Deleted in B; check if A modified it
                 if a.body_hash != base.body_hash {
                     conflicts.push(SemanticConflict {
                         file_path: file_path.to_string(),
@@ -655,7 +835,6 @@ pub fn cst_merge_3way(
                 }
             }
             (Some(base), None, Some(b)) => {
-                // Deleted in A; check if B modified it
                 if b.body_hash != base.body_hash {
                     conflicts.push(SemanticConflict {
                         file_path: file_path.to_string(),
@@ -689,6 +868,10 @@ pub fn cst_merge_3way(
     }
 
     let mut out = String::new();
+    if !header_verbatim_blocks.is_empty() {
+        out.push_str(&header_verbatim_blocks.join("\n"));
+        out.push_str("\n\n");
+    }
     if !import_slices.is_empty() {
         out.push_str(&import_slices.join("\n"));
         out.push_str("\n\n");
@@ -715,12 +898,6 @@ fn format_algebraic_conflict(
 }
 
 /// Cross-File & Intra-File Semantic Conflict Radar.
-///
-/// Inspects two sets of `FileSemanticDelta`s (e.g., from two active agent branches `branch_a`
-/// and `branch_b`) and detects:
-/// 1. `SameSymbolModified`: Both branches modify the same symbol in the same file.
-/// 2. `SignatureCallMismatch`: Branch A modifies the signature of symbol `S` (or deletes `S`),
-///    while Branch B adds/modifies a function that calls `S`!
 pub fn detect_semantic_conflicts(
     branch_a_name: &str,
     branch_a_deltas: &[FileSemanticDelta],
@@ -729,13 +906,12 @@ pub fn detect_semantic_conflicts(
 ) -> Vec<SemanticConflict> {
     let mut conflicts = Vec::new();
 
-    // 1. Check same-file symbol collisions
     for fa in branch_a_deltas {
         for fb in branch_b_deltas {
             if fa.file_path == fb.file_path {
                 for sa in &fa.symbol_deltas {
                     for sb in &fb.symbol_deltas {
-                        if sa.symbol_name == sb.symbol_name {
+                        if sa.kind == sb.kind && sa.symbol_name == sb.symbol_name {
                             conflicts.push(SemanticConflict {
                                 file_path: fa.file_path.clone(),
                                 symbol_name: sa.symbol_name.clone(),
@@ -754,7 +930,6 @@ pub fn detect_semantic_conflicts(
         }
     }
 
-    // 2. Check cross-file and intra-file signature mutation vs. call-site usage
     check_directional_signature_conflicts(
         branch_a_name,
         branch_a_deltas,
@@ -788,7 +963,9 @@ fn check_directional_signature_conflicts(
                     old_signature,
                     new_signature,
                     signature_changed: true,
-                } => Some(format!("changed signature from `{old_signature}` to `{new_signature}`")),
+                } => Some(format!(
+                    "changed signature from `{old_signature}` to `{new_signature}`"
+                )),
                 ChangeOperation::Deleted { old_signature } => {
                     Some(format!("deleted `{old_signature}`"))
                 }
@@ -799,7 +976,6 @@ fn check_directional_signature_conflicts(
                 continue;
             };
 
-            // Check if any modified/inserted symbol in `caller_deltas` calls `sym.symbol_name`
             for caller_file in caller_deltas {
                 let same_file = caller_file.file_path == def_file.file_path;
                 let imports_module_or_symbol = same_file
@@ -842,11 +1018,7 @@ fn check_directional_signature_conflicts(
 
 fn extract_module_stem(file_path: &str) -> String {
     let file_name = file_path.rsplit('/').next().unwrap_or(file_path);
-    file_name
-        .split('.')
-        .next()
-        .unwrap_or("")
-        .to_string()
+    file_name.split('.').next().unwrap_or("").to_string()
 }
 
 #[cfg(test)]
@@ -854,23 +1026,52 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_cst_commutative_merge_same_file_adjacent_additions() {
+    fn test_cst_commutative_merge_preserves_mods_attributes_and_string_braces() {
         let base = "\
+#![allow(dead_code)]
+
 use std::collections::HashMap;
 
-/// Existing function
+pub mod telemetry;
+
+pub struct User {
+    pub id: u64,
+}
+
+impl User {
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+}
+
+/// Existing function with unbalanced brace in string literal
 pub fn health_check() -> &'static str {
+    let _brace_in_str = \"{\";
     \"ok\"
 }
 ";
 
-        // Agent A adds an import and appends `create_user` at the bottom
         let branch_a = "\
+#![allow(dead_code)]
+
 use std::collections::HashMap;
 use serde::Serialize;
 
-/// Existing function
+pub mod telemetry;
+
+pub struct User {
+    pub id: u64,
+}
+
+impl User {
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+}
+
+/// Existing function with unbalanced brace in string literal
 pub fn health_check() -> &'static str {
+    let _brace_in_str = \"{\";
     \"ok\"
 }
 
@@ -880,13 +1081,33 @@ pub fn create_user(name: &str) -> String {
 }
 ";
 
-        // Agent B adds a different import and appends `charge_card` at the exact same bottom lines
         let branch_b = "\
+#![allow(dead_code)]
+
 use std::collections::HashMap;
 use sha2::Sha256;
 
-/// Existing function
+pub mod telemetry;
+
+pub struct User {
+    pub id: u64,
+}
+
+impl User {
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+}
+
+impl std::fmt::Display for User {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, \"User({{{{}}}})\", self.id)
+    }
+}
+
+/// Existing function with unbalanced brace in string literal
 pub fn health_check() -> &'static str {
+    let _brace_in_str = \"{\";
     \"ok\"
 }
 
@@ -910,11 +1131,17 @@ pub fn charge_card(amount_cents: u64) -> bool {
                 merged_source,
                 merged_symbols,
             } => {
+                assert!(merged_source.contains("#![allow(dead_code)]"));
+                assert!(merged_source.contains("pub mod telemetry;"));
+                assert!(merged_source.contains("pub struct User"));
+                assert!(merged_source.contains("impl User"));
+                assert!(merged_source.contains("impl std::fmt::Display for User"));
                 assert!(merged_source.contains("use serde::Serialize;"));
                 assert!(merged_source.contains("use sha2::Sha256;"));
                 assert!(merged_source.contains("/// Added by Agent A\npub fn create_user"));
                 assert!(merged_source.contains("/// Added by Agent B\npub fn charge_card"));
-                assert_eq!(merged_symbols, vec!["create_user", "charge_card"]);
+                assert!(merged_symbols.contains(&"create_user".to_string()));
+                assert!(merged_symbols.contains(&"charge_card".to_string()));
             }
             other => panic!("expected clean commutative CST merge, got {other:?}"),
         }
@@ -927,7 +1154,6 @@ pub fn charge(amount: u64) -> bool {
     amount > 0
 }
 ";
-        // Agent A changes the signature of `charge` in `src/billing.rs`
         let new_billing = "\
 pub fn charge(amount: u64, currency: &str) -> bool {
     amount > 0 && !currency.is_empty()
@@ -941,7 +1167,6 @@ pub fn status() -> bool {
     true
 }
 ";
-        // Agent B adds a function calling `charge(100)` with the old 1-arg signature in `src/checkout.rs`
         let new_checkout = "\
 use crate::billing::charge;
 

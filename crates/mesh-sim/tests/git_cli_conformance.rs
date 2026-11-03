@@ -1,3 +1,4 @@
+use mesh_meta::MeshMetadataStore;
 use mesh_server::{build_router, AppState, MeshEngine};
 use std::fs;
 use std::net::SocketAddr;
@@ -215,4 +216,117 @@ async fn test_semantic_conflict_radar_and_stats_api() {
     assert_eq!(stats.advertised_refs_on_push, 1); // Pando trunk-only advertisement!
     assert!(stats.push_advertisement_bytes < 256);
     assert_eq!(stats.active_semantic_conflicts, 1);
+
+    // 6. Test `git push origin --delete agent-checkout` with `Git-Protocol: target-ref=...`
+    //    (verifies both Bug 5 branch deletion with empty pack and Bug 13 target-ref negotiation)
+    run_git(
+        &w2,
+        &[
+            "-c",
+            "http.extraHeader=Git-Protocol: target-ref=refs/heads/agent-checkout",
+            "push",
+            "origin",
+            "--delete",
+            "agent-checkout",
+        ],
+    );
+    let stats_after_del: mesh_server::RepoStatsResponse = client
+        .get(format!("{base_url}/api/v1/repos/monorepo/stats"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(stats_after_del.total_refs, 2); // main + agent-billing
+    assert_eq!(stats_after_del.active_semantic_conflicts, 0);
+}
+
+/// End-to-End Test for Zero-Checkout Cloud Agent Workspaces (`/workspaces` & `/patches`)
+/// and Durable Journal Persistence (`MeshEngine::with_data_dir`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_zero_checkout_agent_workspace_patch_and_durable_journal() {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().join("mesh_data");
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr: SocketAddr = listener.local_addr().unwrap();
+    let base_url = format!("http://{addr}");
+
+    let engine = Arc::new(MeshEngine::with_data_dir(&data_dir, None).unwrap());
+    let state = AppState {
+        engine,
+        public_base_url: base_url.clone(),
+    };
+    let app = build_router(state);
+
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let client = reqwest::Client::new();
+
+    // 1. Cloud Agent 1 applies an initial patch directly to `refs/heads/main` without `git clone`!
+    let mut initial_files = std::collections::BTreeMap::new();
+    initial_files.insert(
+        "src/lib.rs".to_string(),
+        "pub fn version() -> u32 {\n    1\n}\n".to_string(),
+    );
+    let rv1: mesh_proto::RefVersion = client
+        .post(format!("{base_url}/api/v1/repos/cloudrepo/patches"))
+        .json(&serde_json::json!({
+            "ref_name": "refs/heads/main",
+            "file_updates": initial_files,
+            "message": "Initial cloud agent commit",
+            "intent_receipt": {
+                "agent_id": "codex-cloud-1",
+                "model_id": "gpt-6-astra",
+                "prompt_summary": "Initialize src/lib.rs",
+                "verified_tests": ["test_version"],
+                "timestamp_ms": 1793664000000u64
+            }
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(rv1.version, 1);
+
+    // 2. Cloud Agent 2 opens a Zero-Checkout Virtual Workspace and inspects `src/lib.rs`
+    let ws: mesh_server::VirtualWorkspace = client
+        .post(format!("{base_url}/api/v1/repos/cloudrepo/workspaces"))
+        .json(&serde_json::json!({ "agent_id": "codex-cloud-2" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(ws.base_trunk_version, 1);
+    assert!(ws.files.get("src/lib.rs").unwrap().contains("pub fn version()"));
+
+    // 3. A human developer clones `cloudrepo` using the real `/opt/homebrew/bin/git` CLI
+    //    and verifies the cloud agent's synthesized Git commit is 100% valid Git history!
+    let human_clone = tmp.path().join("human_clone");
+    run_git(
+        tmp.path(),
+        &[
+            "clone",
+            &format!("{base_url}/git/cloudrepo"),
+            "human_clone",
+        ],
+    );
+    let cloned_lib = fs::read_to_string(human_clone.join("src/lib.rs")).unwrap();
+    assert!(cloned_lib.contains("pub fn version() -> u32"));
+
+    // 4. Re-open `MeshEngine::with_data_dir(&data_dir)` from disk journal and verify `refs/heads/main` persisted!
+    let recovered_engine = MeshEngine::with_data_dir(&data_dir, None).unwrap();
+    let recovered_ptr = recovered_engine
+        .meta
+        .get_ref_pointer("cloudrepo", "refs/heads/main")
+        .unwrap();
+    assert_eq!(recovered_ptr.current_version, 1);
+    assert_eq!(recovered_ptr.tip_commit_oid, rv1.new_commit_oid);
 }

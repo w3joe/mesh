@@ -10,3 +10,7 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
+tree-sitter = { workspace = true }
+tree-sitter-rust = { workspace = true }
+tree-sitter-typescript = { workspace = true }
+tree-sitter-python = { workspace = true }

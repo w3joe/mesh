@@ -8,16 +8,21 @@ use axum::{
 };
 use bytes::Bytes;
 use dashmap::DashMap;
-use mesh_blob::{ExpressCacheFleet, ExpressCacheStats, MemoryBlobStore, PackBlobStore};
+use mesh_blob::{
+    DiskBlobStore, ExpressCacheFleet, ExpressCacheStats, MemoryBlobStore, PackBlobStore,
+};
 use mesh_meta::{CausalMetadataStore, MeshMetadataStore, MetaError, PushTransaction};
 use mesh_pack::{
-    build_commit_object, build_trees_from_file_map, compact_packs, decode_and_validate_pack,
-    encode_packfile, extract_commit_files, parse_commit, GitObject, GitObjectType,
+    build_commit_object, build_trees_from_file_entries, compact_packs, decode_and_validate_pack,
+    encode_packfile, extract_commit_file_entries, parse_commit, FileTreeEntry, GitObject,
+    GitObjectType,
 };
 use mesh_pktline::{
-    build_info_refs_advertisement, encode_packfile_uri_response, encode_receive_pack_report,
-    encode_standard_upload_pack_response, parse_receive_pack_request, parse_upload_pack_request,
-    RefUpdateResult,
+    build_info_refs_advertisement, build_protocol_v2_capability_advertisement,
+    encode_packfile_uri_response, encode_protocol_v2_fetch_response,
+    encode_protocol_v2_ls_refs_response, encode_receive_pack_report,
+    encode_standard_upload_pack_response, encode_v1_negotiation_only, parse_git_protocol_header,
+    parse_receive_pack_request, parse_upload_pack_request, RefUpdateResult,
 };
 use mesh_proto::{
     AgentIntentReceipt, FileSemanticDelta, ObjectId, PackCover, PackId, RefVersion,
@@ -28,6 +33,7 @@ use mesh_semantic::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::path::Path as FsPath;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -44,14 +50,24 @@ pub enum EngineError {
     SemanticConflict(String),
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct VirtualWorkspace {
+    pub workspace_id: String,
+    pub repo_id: String,
+    pub agent_id: String,
+    pub base_commit_oid: ObjectId,
+    pub base_trunk_version: u64,
+    pub files: BTreeMap<String, String>,
+}
+
 /// Core Pando + Semantic Agent VCS Engine.
 pub struct MeshEngine {
     pub meta: Arc<CausalMetadataStore>,
     pub blobs: Arc<dyn PackBlobStore>,
     pub express: Arc<ExpressCacheFleet>,
-    /// Fast in-memory content-addressed object index `(repo_id, ObjectId) -> GitObject`
-    /// populated during single-pass streaming pack validation.
     pub objects: DashMap<(String, ObjectId), GitObject>,
+    pub workspaces: DashMap<String, VirtualWorkspace>,
+    pub upstream_git_url: Option<String>,
 }
 
 impl Default for MeshEngine {
@@ -66,14 +82,46 @@ impl MeshEngine {
         let express = Arc::new(ExpressCacheFleet::new(
             blobs.clone(),
             8,
-            256 * 1024 * 1024, // 256 MiB per Express cache node
+            256 * 1024 * 1024,
         ));
         Self {
             meta: Arc::new(CausalMetadataStore::new()),
             blobs,
             express,
             objects: DashMap::new(),
+            workspaces: DashMap::new(),
+            upstream_git_url: None,
         }
+    }
+
+    /// Initializes a durable disk-backed `MeshEngine` storing immutable `.pack` files under
+    /// `<data_dir>/packs` and transactional ref metadata under `<data_dir>/meta.journal.jsonl`.
+    pub fn with_data_dir(
+        data_dir: impl AsRef<FsPath>,
+        upstream_git_url: Option<String>,
+    ) -> Result<Self, EngineError> {
+        let root = data_dir.as_ref();
+        let packs_dir = root.join("packs");
+        let journal_path = root.join("meta.journal.jsonl");
+
+        let disk_blobs = Arc::new(DiskBlobStore::new(&packs_dir)?);
+        let blobs: Arc<dyn PackBlobStore> = disk_blobs;
+        let express = Arc::new(ExpressCacheFleet::new(
+            blobs.clone(),
+            8,
+            256 * 1024 * 1024,
+        ));
+        let meta = Arc::new(CausalMetadataStore::with_journal_path(&journal_path)?);
+        let objects = DashMap::new();
+
+        Ok(Self {
+            meta,
+            blobs,
+            express,
+            objects,
+            workspaces: DashMap::new(),
+            upstream_git_url,
+        })
     }
 
     pub fn get_object(&self, repo_id: &str, oid: &ObjectId) -> Option<GitObject> {
@@ -83,7 +131,8 @@ impl MeshEngine {
     }
 
     /// Single-pass validation, pack storage, semantic lifting, and causal per-ref CAS commit.
-    /// Also handles `refs/mesh/land/<branch>` for server-side CST-commutative merging!
+    /// Supports branch deletion (`new_commit_oid.is_zero()`) and server-side CST-commutative
+    /// landing via `refs/mesh/land/<branch>`.
     pub fn process_push(
         &self,
         repo_id: &str,
@@ -93,10 +142,36 @@ impl MeshEngine {
         pack_bytes: Bytes,
         intent_receipt: Option<AgentIntentReceipt>,
     ) -> Result<(RefVersion, Option<String>), EngineError> {
-        let decoded =
-            decode_and_validate_pack(&pack_bytes, |oid| self.get_object(repo_id, oid))?;
+        // Bug 5 Fix: Handle branch deletion (`new_commit_oid == ZERO`) without decoding an empty pack
+        if new_commit_oid.is_zero() {
+            self.meta
+                .delete_ref(repo_id, ref_name, expected_old_oid)?;
+            let tombstone = RefVersion {
+                repo_id: repo_id.to_string(),
+                ref_name: ref_name.to_string(),
+                version: 0,
+                old_commit_oid: expected_old_oid,
+                new_commit_oid: ObjectId::ZERO,
+                l0_pack_id: PackId("deleted".to_string()),
+                explicit_haves: vec![],
+                base_trunk_version: None,
+                created_at_ms: 0,
+                intent_receipt,
+                semantic_deltas: vec![],
+            };
+            return Ok((tombstone, Some(format!("Deleted ref {ref_name}"))));
+        }
 
-        // Index objects in memory ($O(1)$ per pushed object)
+        let decoded = if pack_bytes.is_empty() {
+            mesh_pack::DecodedPack {
+                objects: Vec::new(),
+                index_entries: Vec::new(),
+                pack_checksum: ObjectId::ZERO,
+            }
+        } else {
+            decode_and_validate_pack(&pack_bytes, |oid| self.get_object(repo_id, oid))?
+        };
+
         let mut introduced_commits = Vec::new();
         for obj in &decoded.objects {
             if obj.obj_type == GitObjectType::Commit {
@@ -121,13 +196,23 @@ impl MeshEngine {
             );
         }
 
-        // Store immutable L0 packfile in Blob Store & warm Express cache
         let l0_pack_id = self.blobs.put_pack(pack_bytes.clone())?;
         self.express.warm_pack(&l0_pack_id, pack_bytes.clone());
 
-        // Determine base commit for semantic lifting (either expected_old_oid or commit's first parent)
+        // Bug 9 Fix: For a new topic branch (`expected_old_oid == ZERO`), diff against the trunk
+        // base commit (`refs/heads/main`) so multi-commit branch pushes capture all branch deltas.
         let diff_base_oid = if !expected_old_oid.is_zero() {
             expected_old_oid
+        } else if ref_name != "refs/heads/main" {
+            self.meta
+                .get_ref_pointer(repo_id, "refs/heads/main")
+                .map(|p| p.tip_commit_oid)
+                .or_else(|| {
+                    self.get_object(repo_id, &new_commit_oid)
+                        .and_then(|o| parse_commit(&o.data).ok())
+                        .and_then(|c| c.parent_oids.first().copied())
+                })
+                .unwrap_or(ObjectId::ZERO)
         } else if let Some(commit_obj) = self.get_object(repo_id, &new_commit_oid) {
             parse_commit(&commit_obj.data)
                 .ok()
@@ -159,8 +244,6 @@ impl MeshEngine {
     }
 
     /// Server-side CST-Commutative Landing (`git push origin HEAD:refs/mesh/land/main`).
-    /// If `target_ref` has advanced past the pushed commit's parent, automatically splices
-    /// orthogonal CST declarations and checks cross-file signature/call safety!
     fn land_commit_onto_target(
         &self,
         repo_id: &str,
@@ -184,16 +267,16 @@ impl MeshEngine {
             .copied()
             .unwrap_or(ObjectId::ZERO);
 
-        // Fast-forward case: target_ref is still at base_oid
+        // Fast-forward case
         if current_target_oid == base_oid {
             let mut commit_objs = Vec::new();
-            let files = extract_commit_files(&pushed_commit_oid, &lookup)?;
-            for blob_oid in files.values() {
-                if let Some(b) = lookup(blob_oid) {
+            let files = extract_commit_file_entries(&pushed_commit_oid, &lookup)?;
+            for entry in files.values() {
+                if let Some(b) = lookup(&entry.oid) {
                     commit_objs.push(b);
                 }
             }
-            let (_, mut trees) = build_trees_from_file_map(&files);
+            let (_, mut trees) = build_trees_from_file_entries(&files);
             commit_objs.append(&mut trees);
             commit_objs.push(pushed_commit_obj.clone());
 
@@ -220,8 +303,7 @@ impl MeshEngine {
             return Ok((rv, Some(format!("Fast-forward landed onto {target_ref}"))));
         }
 
-        // Non-fast-forward case: `target_ref` moved from `base_oid` to `current_target_oid`.
-        // Run cross-file Semantic Conflict Radar + CST-Commutative 3-Way Merge!
+        // Non-fast-forward case: run Semantic Conflict Radar + CST-Commutative 3-Way Merge
         let trunk_deltas =
             self.compute_commit_semantic_deltas(repo_id, &base_oid, &current_target_oid);
         let incoming_deltas =
@@ -239,9 +321,10 @@ impl MeshEngine {
             ));
         }
 
-        let base_files = extract_commit_files(&base_oid, &lookup)?;
-        let trunk_files = extract_commit_files(&current_target_oid, &lookup)?;
-        let incoming_files = extract_commit_files(&pushed_commit_oid, &lookup)?;
+        // Bug 4 Fix: Use `extract_commit_file_entries` so executable (`100755`) & symlink (`120000`) modes are preserved!
+        let base_files = extract_commit_file_entries(&base_oid, &lookup)?;
+        let trunk_files = extract_commit_file_entries(&current_target_oid, &lookup)?;
+        let incoming_files = extract_commit_file_entries(&pushed_commit_oid, &lookup)?;
 
         let mut all_paths: BTreeMap<String, ()> = BTreeMap::new();
         for k in base_files
@@ -252,41 +335,57 @@ impl MeshEngine {
             all_paths.insert(k.clone(), ());
         }
 
-        let mut merged_file_map = BTreeMap::new();
-        let mut new_blobs = Vec::new();
+        let mut merged_file_entries: BTreeMap<String, FileTreeEntry> = BTreeMap::new();
         let mut spliced_symbols = Vec::new();
 
         for path in all_paths.keys() {
-            let b_oid = base_files.get(path).copied();
-            let t_oid = trunk_files.get(path).copied();
-            let i_oid = incoming_files.get(path).copied();
+            let b_entry = base_files.get(path);
+            let t_entry = trunk_files.get(path);
+            let i_entry = incoming_files.get(path);
 
-            match (b_oid, t_oid, i_oid) {
+            match (b_entry, t_entry, i_entry) {
                 (_, Some(t), Some(i)) if t == i => {
-                    merged_file_map.insert(path.clone(), t);
+                    merged_file_entries.insert(path.clone(), t.clone());
                 }
                 (Some(b), Some(t), Some(i)) if b == t => {
-                    merged_file_map.insert(path.clone(), i);
+                    merged_file_entries.insert(path.clone(), i.clone());
                 }
                 (Some(b), Some(t), Some(i)) if b == i => {
-                    merged_file_map.insert(path.clone(), t);
+                    merged_file_entries.insert(path.clone(), t.clone());
                 }
                 (None, Some(t), None) => {
-                    merged_file_map.insert(path.clone(), t);
+                    merged_file_entries.insert(path.clone(), t.clone());
                 }
                 (None, None, Some(i)) => {
-                    merged_file_map.insert(path.clone(), i);
+                    merged_file_entries.insert(path.clone(), i.clone());
                 }
+                // Bug 2 Fix: Explicit Modify/Delete and Delete/Modify conflict checks!
+                (Some(b), Some(t), None) => {
+                    if b.oid != t.oid {
+                        return Err(EngineError::SemanticConflict(format!(
+                            "FileModifyDeleteConflict on '{path}': modified on '{target_ref}' but deleted by incoming branch"
+                        )));
+                    }
+                    // Otherwise b.oid == t.oid: clean deletion by incoming branch
+                }
+                (Some(b), None, Some(i)) => {
+                    if b.oid != i.oid {
+                        return Err(EngineError::SemanticConflict(format!(
+                            "FileModifyDeleteConflict on '{path}': deleted on '{target_ref}' but modified by incoming branch"
+                        )));
+                    }
+                    // Otherwise b.oid == i.oid: clean deletion on trunk
+                }
+                (Some(_), None, None) | (None, None, None) => {}
                 (_, Some(t), Some(i)) => {
-                    // Both trunk and incoming modified or created `path`!
-                    let base_src = b_oid
-                        .and_then(|id| lookup(&id))
+                    let base_src = b_entry
+                        .and_then(|e| lookup(&e.oid))
                         .map(|o| String::from_utf8_lossy(&o.data).to_string())
                         .unwrap_or_default();
-                    let trunk_src = lookup(&t)
+                    let trunk_src = lookup(&t.oid)
                         .map(|o| String::from_utf8_lossy(&o.data).to_string())
                         .unwrap_or_default();
-                    let incoming_src = lookup(&i)
+                    let incoming_src = lookup(&i.oid)
                         .map(|o| String::from_utf8_lossy(&o.data).to_string())
                         .unwrap_or_default();
 
@@ -305,12 +404,22 @@ impl MeshEngine {
                             spliced_symbols.extend(merged_symbols);
                             let merged_blob =
                                 GitObject::new(GitObjectType::Blob, Bytes::from(merged_source));
-                            merged_file_map.insert(path.clone(), merged_blob.oid);
+                            let merged_mode = if i.mode != "100644" {
+                                i.mode.clone()
+                            } else {
+                                t.mode.clone()
+                            };
+                            merged_file_entries.insert(
+                                path.clone(),
+                                FileTreeEntry {
+                                    mode: merged_mode,
+                                    oid: merged_blob.oid,
+                                },
+                            );
                             self.objects.insert(
                                 (repo_id.to_string(), merged_blob.oid),
-                                merged_blob.clone(),
+                                merged_blob,
                             );
-                            new_blobs.push(merged_blob);
                         }
                         CstMergeOutcome::Conflict { conflicts, .. } => {
                             let msg = conflicts
@@ -321,11 +430,10 @@ impl MeshEngine {
                         }
                     }
                 }
-                _ => {}
             }
         }
 
-        let (root_tree_oid, created_trees) = build_trees_from_file_map(&merged_file_map);
+        let (root_tree_oid, created_trees) = build_trees_from_file_entries(&merged_file_entries);
         for t in &created_trees {
             self.objects
                 .insert((repo_id.to_string(), t.oid), t.clone());
@@ -353,8 +461,8 @@ impl MeshEngine {
         );
 
         let mut pack_objs = Vec::new();
-        for oid in merged_file_map.values() {
-            if let Some(entry) = self.objects.get(&(repo_id.to_string(), *oid)) {
+        for fe in merged_file_entries.values() {
+            if let Some(entry) = self.objects.get(&(repo_id.to_string(), fe.oid)) {
                 pack_objs.push(entry.value().clone());
             }
         }
@@ -365,11 +473,8 @@ impl MeshEngine {
         let l0_pack_id = self.blobs.put_pack(pack_bytes.clone())?;
         self.express.warm_pack(&l0_pack_id, pack_bytes.clone());
 
-        let final_deltas = self.compute_commit_semantic_deltas(
-            repo_id,
-            &current_target_oid,
-            &merged_commit.oid,
-        );
+        let final_deltas =
+            self.compute_commit_semantic_deltas(repo_id, &current_target_oid, &merged_commit.oid);
 
         let rv = self.meta.commit_push(PushTransaction {
             repo_id: repo_id.to_string(),
@@ -403,14 +508,17 @@ impl MeshEngine {
         let old_files = if old_commit_oid.is_zero() {
             BTreeMap::new()
         } else {
-            extract_commit_files(old_commit_oid, &lookup).unwrap_or_default()
+            extract_commit_file_entries(old_commit_oid, &lookup).unwrap_or_default()
         };
-        let new_files = extract_commit_files(new_commit_oid, &lookup).unwrap_or_default();
+        let new_files = extract_commit_file_entries(new_commit_oid, &lookup).unwrap_or_default();
 
         let mut deltas = Vec::new();
-        for (path, new_blob_oid) in &new_files {
-            let old_blob_oid = old_files.get(path).copied().unwrap_or(ObjectId::ZERO);
-            if old_blob_oid == *new_blob_oid {
+        for (path, new_entry) in &new_files {
+            let old_blob_oid = old_files
+                .get(path)
+                .map(|e| e.oid)
+                .unwrap_or(ObjectId::ZERO);
+            if old_blob_oid == new_entry.oid {
                 continue;
             }
             let old_src = if old_blob_oid.is_zero() {
@@ -420,22 +528,142 @@ impl MeshEngine {
                     .map(|o| String::from_utf8_lossy(&o.data).to_string())
                     .unwrap_or_default()
             };
-            let new_src = lookup(new_blob_oid)
+            let new_src = lookup(&new_entry.oid)
                 .map(|o| String::from_utf8_lossy(&o.data).to_string())
                 .unwrap_or_default();
 
-            if let Some(delta) =
-                compute_file_semantic_delta(path, old_blob_oid, *new_blob_oid, &old_src, &new_src)
-            {
+            if let Some(delta) = compute_file_semantic_delta(
+                path,
+                old_blob_oid,
+                new_entry.oid,
+                &old_src,
+                &new_src,
+            ) {
                 deltas.push(delta);
             }
         }
         deltas
     }
 
-    /// Background LSM Compaction Worker:
-    /// Combines contiguous sequences of `fanout` covers at `source_level` on `ref_name`
-    /// into consolidated `source_level + 1` covers without deleting lower-level packs!
+    /// Creates a sub-millisecond Zero-Checkout Virtual Workspace anchored at `refs/heads/main`.
+    pub fn create_virtual_workspace(
+        &self,
+        repo_id: &str,
+        agent_id: &str,
+    ) -> Result<VirtualWorkspace, EngineError> {
+        let ptr = self
+            .meta
+            .get_ref_pointer(repo_id, "refs/heads/main")
+            .unwrap_or(RefPointerPlaceholder::empty(repo_id));
+        let lookup = |oid: &ObjectId| self.get_object(repo_id, oid);
+        let file_entries = if ptr.tip_commit_oid.is_zero() {
+            BTreeMap::new()
+        } else {
+            extract_commit_file_entries(&ptr.tip_commit_oid, &lookup)?
+        };
+
+        let mut files = BTreeMap::new();
+        for (path, entry) in file_entries {
+            if let Some(blob) = lookup(&entry.oid) {
+                files.insert(path, String::from_utf8_lossy(&blob.data).to_string());
+            }
+        }
+
+        let ws_id = format!("ws-{}-v{}", agent_id, ptr.current_version);
+        let ws = VirtualWorkspace {
+            workspace_id: ws_id.clone(),
+            repo_id: repo_id.to_string(),
+            agent_id: agent_id.to_string(),
+            base_commit_oid: ptr.tip_commit_oid,
+            base_trunk_version: ptr.current_version,
+            files,
+        };
+        self.workspaces.insert(ws_id, ws.clone());
+        Ok(ws)
+    }
+
+    /// Applies an Agent Intent Patch directly in memory on the server without requiring a local `.git` checkout.
+    pub fn apply_agent_intent_patch(
+        &self,
+        repo_id: &str,
+        ref_name: &str,
+        file_updates: BTreeMap<String, String>,
+        message: &str,
+        intent_receipt: Option<AgentIntentReceipt>,
+    ) -> Result<RefVersion, EngineError> {
+        let base_ptr = if ref_name.starts_with("refs/mesh/land/") {
+            self.meta.get_ref_pointer(repo_id, "refs/heads/main")
+        } else {
+            self.meta
+                .get_ref_pointer(repo_id, ref_name)
+                .or_else(|| self.meta.get_ref_pointer(repo_id, "refs/heads/main"))
+        };
+        let parent_oid = base_ptr
+            .as_ref()
+            .map(|p| p.tip_commit_oid)
+            .unwrap_or(ObjectId::ZERO);
+        let expected_old_oid = self
+            .meta
+            .get_ref_pointer(repo_id, ref_name)
+            .map(|p| p.tip_commit_oid)
+            .unwrap_or(ObjectId::ZERO);
+
+        let lookup = |oid: &ObjectId| self.get_object(repo_id, oid);
+        let mut entries = if parent_oid.is_zero() {
+            BTreeMap::new()
+        } else {
+            extract_commit_file_entries(&parent_oid, &lookup)?
+        };
+
+        let mut objects_to_pack = Vec::new();
+        for (path, content) in file_updates {
+            let blob = GitObject::new(GitObjectType::Blob, Bytes::from(content));
+            let mode = entries
+                .get(&path)
+                .map(|e| e.mode.clone())
+                .unwrap_or_else(|| "100644".to_string());
+            entries.insert(
+                path,
+                FileTreeEntry {
+                    mode,
+                    oid: blob.oid,
+                },
+            );
+            objects_to_pack.push(blob);
+        }
+
+        let (root_tree_oid, mut trees) = build_trees_from_file_entries(&entries);
+        objects_to_pack.append(&mut trees);
+
+        let now_sec = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let author = intent_receipt
+            .as_ref()
+            .map(|r| format!("{} <{}@agent.mesh>", r.agent_id, r.agent_id))
+            .unwrap_or_else(|| "Mesh Agent <agent@mesh.local>".to_string());
+        let parents = if parent_oid.is_zero() {
+            vec![]
+        } else {
+            vec![parent_oid]
+        };
+        let commit = build_commit_object(root_tree_oid, &parents, &author, now_sec, message);
+        let new_commit_oid = commit.oid;
+        objects_to_pack.push(commit);
+
+        let pack_bytes = encode_packfile(&objects_to_pack);
+        let (rv, _) = self.process_push(
+            repo_id,
+            ref_name,
+            expected_old_oid,
+            new_commit_oid,
+            pack_bytes,
+            intent_receipt,
+        )?;
+        Ok(rv)
+    }
+
     pub fn compact_branch_level(
         &self,
         repo_id: &str,
@@ -456,7 +684,6 @@ impl MeshEngine {
             if chunk.len() < fanout.max(2) {
                 break;
             }
-            // Verify chunk covers a contiguous range of ref versions
             let mut contiguous = true;
             for w in chunk.windows(2) {
                 if w[1].start_version != w[0].end_version + 1 {
@@ -498,7 +725,6 @@ impl MeshEngine {
         Ok(created)
     }
 
-    /// Scans all active topic branches in `repo_id` and returns any pre-merge semantic conflicts.
     pub fn scan_conflict_radar(&self, repo_id: &str) -> Vec<SemanticConflict> {
         let refs = self.meta.list_all_refs(repo_id);
         let mut branch_deltas: Vec<(String, Vec<FileSemanticDelta>)> = Vec::new();
@@ -540,9 +766,6 @@ impl MeshEngine {
         all_conflicts
     }
 
-    /// Batch Commutative Trunk Landing (`mesh land`):
-    /// Merges multiple independent agent branches onto `refs/heads/main` in a single cycle
-    /// without sequential client-side rebases.
     pub fn batch_commutative_land(
         &self,
         repo_id: &str,
@@ -571,6 +794,19 @@ impl MeshEngine {
     }
 }
 
+struct RefPointerPlaceholder;
+impl RefPointerPlaceholder {
+    fn empty(repo_id: &str) -> mesh_proto::RefPointer {
+        mesh_proto::RefPointer {
+            repo_id: repo_id.to_string(),
+            ref_name: "refs/heads/main".to_string(),
+            current_version: 0,
+            tip_commit_oid: ObjectId::ZERO,
+            base_trunk_version: None,
+        }
+    }
+}
+
 // ============================================================================
 // HTTP Server & Routes (Git Smart HTTP v1/v2 + Express CDN + Agent REST API)
 // ============================================================================
@@ -589,7 +825,13 @@ pub fn build_router(state: AppState) -> Router {
         .route("/git/:repo/git-upload-pack", post(handle_upload_pack))
         // Express Consistent-Hashed Pack CDN
         .route("/express/packs/:pack_id", get(handle_express_pack_download))
-        // Agent-Native Semantic & Admin API
+        // Agent-Native Semantic & Zero-Checkout Workspace API
+        .route("/api/v1/repos/:repo/workspaces", post(handle_create_workspace))
+        .route(
+            "/api/v1/repos/:repo/workspaces/:ws_id",
+            get(handle_get_workspace),
+        )
+        .route("/api/v1/repos/:repo/patches", post(handle_apply_patch))
         .route("/api/v1/repos/:repo/radar", get(handle_conflict_radar))
         .route("/api/v1/repos/:repo/land", post(handle_batch_land))
         .route("/api/v1/repos/:repo/compact", post(handle_compact))
@@ -607,22 +849,45 @@ async fn handle_info_refs(
     State(state): State<AppState>,
     Path(repo): Path<String>,
     Query(query): Query<InfoRefsQuery>,
+    headers: HeaderMap,
 ) -> Response {
     let service = query.service.as_deref().unwrap_or("git-upload-pack");
-    // Pando Trunk-Only Ref Advertisement on push; all advertised refs or trunk+target on fetch
+    let git_proto = parse_git_protocol_header(
+        headers
+            .get("git-protocol")
+            .and_then(|v| v.to_str().ok()),
+    );
+
+    let content_type = format!("application/x-{service}-advertisement");
+
+    // Bug 6 Fix: If client sends `Git-Protocol: version=2` for `git-upload-pack`,
+    // respond with Protocol v2 capability advertisement (`ls-refs`, `fetch=packfile-uris`)!
+    if service == "git-upload-pack" && git_proto.version == 2 {
+        let body = build_protocol_v2_capability_advertisement(service);
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, content_type)
+            .header(header::CACHE_CONTROL, "no-cache")
+            .body(Body::from(body))
+            .unwrap();
+    }
+
+    // Bug 13 Fix: Resolve `target_ref` from query param OR `Git-Protocol: target-ref=...`
+    let target_ref = query
+        .target_ref
+        .as_deref()
+        .or(git_proto.target_ref.as_deref());
+
     let advertised = if service == "git-receive-pack" {
-        state.engine.meta.list_advertised_refs(
-            &repo,
-            "refs/heads/main",
-            query.target_ref.as_deref(),
-        )
+        state
+            .engine
+            .meta
+            .list_advertised_refs(&repo, "refs/heads/main", target_ref)
     } else {
         state.engine.meta.list_all_refs(&repo)
     };
 
     let body = build_info_refs_advertisement(service, &advertised);
-    let content_type = format!("application/x-{service}-advertisement");
-
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, content_type)
@@ -730,11 +995,38 @@ async fn handle_upload_pack(
         }
     };
 
+    // Bug 6 Fix: Handle Protocol v2 `command=ls-refs`
+    if req.is_protocol_v2_ls_refs {
+        let all_refs = state.engine.meta.list_all_refs(&repo);
+        let resp = encode_protocol_v2_ls_refs_response(&all_refs, &req.ref_prefixes);
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/x-git-upload-pack-result")
+            .body(Body::from(resp))
+            .unwrap();
+    }
+
     if req.wants.is_empty() {
         return Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "application/x-git-upload-pack-result")
             .body(Body::from(Bytes::from_static(b"0000")))
+            .unwrap();
+    }
+
+    // Bug 7 Fix: Multi-round Smart HTTP v1 negotiation when `done == false` and `no-done` is not set
+    if !req.is_protocol_v2_fetch && !req.done && !req.no_done {
+        let common: Vec<ObjectId> = req
+            .haves
+            .iter()
+            .copied()
+            .filter(|oid| state.engine.meta.resolve_commit(&repo, oid).is_some())
+            .collect();
+        let ack_nak = encode_v1_negotiation_only(&common);
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/x-git-upload-pack-result")
+            .body(Body::from(ack_nak))
             .unwrap();
     }
 
@@ -765,8 +1057,6 @@ async fn handle_upload_pack(
             .unwrap();
     }
 
-    // Standard Smart HTTP v1 fallback for stock `git` clients:
-    // Fetch each planned cover from Express (recording cache hits!) and consolidate.
     let mut raw_packs = Vec::with_capacity(plan.selected_covers.len());
     for cover in &plan.selected_covers {
         if let Ok(p) = state.engine.express.fetch_pack(&cover.pack_id) {
@@ -782,12 +1072,22 @@ async fn handle_upload_pack(
         plan.selected_covers.len(),
         plan.metadata_reads
     );
-    let response_bytes = encode_standard_upload_pack_response(
-        &consolidated_pack,
-        req.haves.first().copied(),
-        Some(&info_msg),
-        req.supports_sideband,
-    );
+
+    let response_bytes = if req.is_protocol_v2_fetch {
+        encode_protocol_v2_fetch_response(
+            &consolidated_pack,
+            req.haves.first().copied(),
+            req.done,
+            Some(&info_msg),
+        )
+    } else {
+        encode_standard_upload_pack_response(
+            &consolidated_pack,
+            req.haves.first().copied(),
+            Some(&info_msg),
+            req.supports_sideband,
+        )
+    };
 
     Response::builder()
         .status(StatusCode::OK)
@@ -813,6 +1113,61 @@ async fn handle_express_pack_download(
             .unwrap(),
         Err(e) => (StatusCode::NOT_FOUND, e.to_string()).into_response(),
     }
+}
+
+#[derive(Deserialize)]
+pub struct CreateWorkspaceRequest {
+    pub agent_id: String,
+}
+
+async fn handle_create_workspace(
+    State(state): State<AppState>,
+    Path(repo): Path<String>,
+    Json(req): Json<CreateWorkspaceRequest>,
+) -> Result<Json<VirtualWorkspace>, (StatusCode, String)> {
+    state
+        .engine
+        .create_virtual_workspace(&repo, &req.agent_id)
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+async fn handle_get_workspace(
+    State(state): State<AppState>,
+    Path((_repo, ws_id)): Path<(String, String)>,
+) -> Result<Json<VirtualWorkspace>, (StatusCode, String)> {
+    state
+        .engine
+        .workspaces
+        .get(&ws_id)
+        .map(|r| Json(r.value().clone()))
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("workspace '{ws_id}' not found")))
+}
+
+#[derive(Deserialize)]
+pub struct ApplyPatchRequest {
+    pub ref_name: String,
+    pub file_updates: BTreeMap<String, String>,
+    pub message: String,
+    pub intent_receipt: Option<AgentIntentReceipt>,
+}
+
+async fn handle_apply_patch(
+    State(state): State<AppState>,
+    Path(repo): Path<String>,
+    Json(req): Json<ApplyPatchRequest>,
+) -> Result<Json<RefVersion>, (StatusCode, String)> {
+    state
+        .engine
+        .apply_agent_intent_patch(
+            &repo,
+            &req.ref_name,
+            req.file_updates,
+            &req.message,
+            req.intent_receipt,
+        )
+        .map(Json)
+        .map_err(|e| (StatusCode::CONFLICT, e.to_string()))
 }
 
 async fn handle_conflict_radar(

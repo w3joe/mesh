@@ -38,6 +38,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rand = "0.8"
 tempfile = "3.12"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+tree-sitter = "0.24"
+tree-sitter-rust = "0.23"
+tree-sitter-typescript = "0.23"
+tree-sitter-python = "0.23"
 
 mesh-proto = { path = "crates/mesh-proto" }
 mesh-pack = { path = "crates/mesh-pack" }

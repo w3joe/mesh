@@ -171,7 +171,7 @@ pub struct PackCover {
     pub object_count: u32,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum SymbolKind {
     Import,
     Function,
@@ -183,6 +183,10 @@ pub enum SymbolKind {
     Interface,
     TypeAlias,
     Const,
+    Static,
+    Module,
+    Macro,
+    VerbatimBlock,
 }
 
 /// Concrete Syntax Tree (CST) span for a top-level declaration in a source file.
@@ -238,6 +242,8 @@ pub enum SemanticConflictKind {
     SameSymbolModified,
     /// Branch A changed the signature of symbol `S`, while Branch B added/modified a call to `S`.
     SignatureCallMismatch,
+    /// One branch modified a file while the other branch deleted it.
+    FileModifyDeleteConflict,
     /// File could not be parsed cleanly into CST declarations and had overlapping line edits.
     UnstructuredOverlapFallback,
 }
