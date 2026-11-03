@@ -1,0 +1,30 @@
+[package]
+name = "mesh-sim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "mesh-sim"
+path = "src/main.rs"
+
+[dependencies]
+mesh-proto = { workspace = true }
+mesh-pack = { workspace = true }
+mesh-meta = { workspace = true }
+mesh-blob = { workspace = true }
+mesh-pktline = { workspace = true }
+mesh-semantic = { workspace = true }
+mesh-server = { workspace = true }
+anyhow = { workspace = true }
+bytes = { workspace = true }
+parking_lot = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+axum = { workspace = true }
+tempfile = { workspace = true }
+reqwest = { workspace = true }

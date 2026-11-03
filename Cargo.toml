@@ -1,0 +1,48 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/mesh-proto",
+    "crates/mesh-pack",
+    "crates/mesh-meta",
+    "crates/mesh-blob",
+    "crates/mesh-pktline",
+    "crates/mesh-semantic",
+    "crates/mesh-server",
+    "crates/mesh-sim",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["Mesh Contributors"]
+
+[workspace.dependencies]
+anyhow = "1.0"
+thiserror = "2.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+bytes = "1.7"
+sha1 = "0.10"
+sha2 = "0.10"
+hex = "0.4"
+flate2 = "1.0"
+crc32fast = "1.4"
+parking_lot = "0.12"
+dashmap = "6.1"
+tokio = { version = "1.40", features = ["full"] }
+axum = { version = "0.7", features = ["macros"] }
+tower = "0.5"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rand = "0.8"
+tempfile = "3.12"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
+mesh-proto = { path = "crates/mesh-proto" }
+mesh-pack = { path = "crates/mesh-pack" }
+mesh-meta = { path = "crates/mesh-meta" }
+mesh-blob = { path = "crates/mesh-blob" }
+mesh-pktline = { path = "crates/mesh-pktline" }
+mesh-semantic = { path = "crates/mesh-semantic" }
+mesh-server = { path = "crates/mesh-server" }
